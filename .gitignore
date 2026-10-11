@@ -12,3 +12,8 @@ corpus/*.json
 corpus/*.jsonl
 corpus/**/*.txt
 results/*.jsonl
+
+# Internal working documents: kept in the working copy, never published.
+/todo.md
+/plan.md
+/docs/
