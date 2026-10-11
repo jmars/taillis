@@ -2,7 +2,13 @@
 models/
 venvs/
 logs/
-results/*.gguf
 *.gguf
 __pycache__/
 *.pyc
+
+# Calibration corpora are built from PRIVATE agent transcripts: never committed.
+corpus/*.txt
+corpus/*.json
+corpus/*.jsonl
+corpus/**/*.txt
+results/*.jsonl
