@@ -37,7 +37,8 @@ from collections import Counter
 from pathlib import Path
 
 DEFAULT_SESSIONS = "~/.local/state/hax/sessions"
-DEFAULT_TEMPLATE = "/var/data/workspace/mistral4-rx9070/models/Mistral-Small-4-119B-2603/chat_template.jinja"
+DEFAULT_TEMPLATE = str(Path(__file__).resolve().parent.parent
+                       / "models/Mistral-Small-4-119B-2603/chat_template.jinja")
 MARKER = "TAILLIS_IMATRIX_PROMPT"
 DEFAULT_BUDGET_BYTES = 8_388_608  # ~2M tokens at the coarse bytes/4 estimate
 
@@ -202,7 +203,30 @@ def render_plain(meta: dict, events, redact_counts: Counter) -> str:
 
 
 def render_template(meta: dict, events, template_path: str, redact_counts: Counter):
-    """Render through a chat template jinja file (llama.cpp-style args)."""
+    """Render through a chat template jinja file (llama.cpp-style args).
+
+    The rendered body is capped at CONVERSATION_CAP exactly as render_plain's
+    is, but the cap is applied to the MESSAGE LIST, never to the rendered
+    string: a byte slice can cut through a special token and produce a
+    malformed sequence. Two properties are load-bearing:
+
+      (1) the cap drops WHOLE trailing messages, and
+      (2) the truncated body is a valid render of a message PREFIX, and a
+          prefix of the uncapped render of the same conversation -- nothing
+          inside a kept message is altered. One measured caveat belongs to the
+          template, not to us: every render ends with a constant newline run
+          emitted after its loop (keep_trailing_newline), so the prefix
+          relation holds once that constant tail is stripped from both.
+
+    The cut is restricted to ROLE boundaries. This template merges consecutive
+    same-role messages into one [INST]...[/INST] block (tool_call and
+    tool_result both map to role "user"), so a cut inside such a run renders
+    the block CLOSED early and the result is no longer a prefix of the uncapped
+    render (MEASURED 2026-10-11 on synthetic fixtures). Keeping only every
+    role-boundary prefix keeps property (2) true; it costs some granularity,
+    which is bounded by the run length (a run is a user turn or a run of
+    assistant/reasoning messages, not the whole conversation).
+    """
     import jinja2  # deferred: only needed on the template path
 
     tmpl_src = Path(template_path).read_text(encoding="utf-8")
@@ -224,7 +248,39 @@ def render_template(meta: dict, events, template_path: str, redact_counts: Count
             messages.append({"role": "user", "content": "TOOL_CALL: " + text})
         elif kind == "tool_result":
             messages.append({"role": "user", "content": "TOOL_RESULT: " + text})
-    return tmpl.render(messages=messages, add_generation_prompt=False, bos_token="<s>", eos_token="</s>") + "\n"
+
+    def at(k: int) -> str:
+        """Render the first k messages (cached; one render per distinct k)."""
+        if k not in cache:
+            cache[k] = tmpl.render(
+                messages=messages[:k], add_generation_prompt=False,
+                bos_token="<s>", eos_token="</s>",
+            ) + "\n"
+        return cache[k]
+
+    cache: dict[int, str] = {}
+    full = at(len(messages))
+    if len(full) <= CONVERSATION_CAP:
+        return full
+
+    # Largest role-boundary prefix that fits the cap. Rendered length is
+    # monotone in the number of messages kept (each kept message contributes a
+    # whole block), so binary search finds it in O(log n) renders instead of
+    # re-rendering once per dropped message.
+    cuts = [k for k in range(1, len(messages))
+            if messages[k]["role"] != messages[k - 1]["role"]]
+    if not cuts:  # a lone message: keeping it or dropping it are the only options
+        return full
+    lo, hi = 0, len(cuts) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if len(at(cuts[mid])) <= CONVERSATION_CAP:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    # hi < 0 means even the shortest prefix (the system preamble alone) is over
+    # the cap; return that prefix anyway rather than slicing the render.
+    return at(cuts[hi] if hi >= 0 else cuts[0])
 
 
 # ---------------------------------------------------------------------------
