@@ -92,10 +92,22 @@ BF16 source" was wrong on both counts.**
 **The practical consequence is good news, and it replaces an assumption with a fact:** the earlier
 claim that T1 needs a ~240 GB BF16 download to avoid re-quantizing a 2-bit file was unnecessary.
 `convert_hf_to_gguf.py` handles this checkpoint (`--fp8-as-q8` exists for the FP8 path), and because
-**every E4M3 value maps exactly into F16**, converting with `--outtype f16` reproduces the source
-weights losslessly at ~225 GiB — i.e. the "≥16-bit source" the quantizer needs is obtainable **from
-what is already on disk**, and requantizing the existing IQ2_XXS GGUF remains the invalid option it
-was. (The conversion is a CPU/disk job; it must not run concurrently with a timing measurement.)
+**every E4M3 value maps exactly into F16**, `--outtype f16` needs no requantization — every fp8 code
+and its scale survive exactly.
+
+The store is *not* bit-lossless, and the earlier "reproduces the source weights losslessly" was an
+overclaim: the dequantized value is rounded to F16. **MEASURED 2026-10-11 over two full routed-expert
+tensors** (~3.2e9 elements): 11.8–14.8% of elements round, maximum **absolute** error 1.2e-4 = f16's
+half-ulp at those magnitudes — three orders of magnitude below the error any 2–4 bit quantization
+introduces, so it is immaterial *here*, but it is rounding, not losslessness.
+
+**And it is now built and verified, not merely obtainable (T1.2, 2026-10-11):**
+`models/Mistral-Small-4-119B-2603-f16.gguf` — **221.647 GiB** (not ~225), `general.architecture =
+mistral4`, 579 tensors, tensor table identical in names and shapes to the IQ2_XXS GGUF we run, fp8
+dequantization proved exact elementwise with a working negative control, and the artifact loads and
+generates. Details and the cannot-verify list: `results/t1-f16.md`. Requantizing the existing
+IQ2_XXS GGUF remains the invalid option it was. (The conversion is a CPU/disk job; it must not run
+concurrently with a timing measurement.)
 
 **And a structural fact that changes how T2 looks:** the `consolidated` representation carries
 **every expert individually** — `layers.N.experts.N.w1/w2/w3.weight` plus per-expert
