@@ -97,3 +97,30 @@ T2 is entered only when:
 result is ds4's imatrix on Q4 routed experts, **−1.95% relative NLL** (vendor-reported, 100
 continuations). Per-expert *type* allocation is not something ds4 does at all, so it has **no**
 measured prior — a null result is a legitimate and useful outcome of this repository.
+
+## 6. Correction (2026-10-11): the SOURCE already carries experts individually
+
+Read from the downloaded checkpoint's index this session — the `consolidated` representation names
+**every expert as its own tensor**, with its own weight and activation scales:
+
+```
+layers.N.experts.E.w1.weight / .qscale_weight / .qscale_act     (w1 = gate)
+layers.N.experts.E.w2.weight / .qscale_weight / .qscale_act     (w2 = down)
+layers.N.experts.E.w3.weight / .qscale_weight / .qscale_act     (w3 = up)
+```
+
+4,608 tensors per projection = **36 layers × 128 experts**, exactly. The checkpoint is FP8 (E4M3,
+`qscheme_act: TENSOR`), so those scales are part of the source, not something we invent.
+
+**What this changes:**
+- T2's grouping is **not** a slicing exercise on a fused tensor — the source is already per-expert. The
+  work is in what we *write* (a runtime file has one type per tensor, so groups must become separate
+  tensors) and in the **policy** (which experts share a group), not in decomposing the input.
+- The per-expert weight scales are a free, upstream signal about each expert's dynamic range — useful
+  as a **feature** in the allocation policy, and a sanity check against our own routing-hotness trace.
+  They are not the same thing as hotness: a scale says how large the weights are, not how often the
+  expert is chosen.
+- Note the naming mismatch to bridge: the source has **w1 / w2 / w3** per expert; the GGUF we run fuses
+  **w1+w3 into one `ffn_gate_up_exps` tensor** per layer and keeps w2 as `ffn_down_exps`. A grouped
+  writer has to decide whether its groups respect the source's natural per-expert layout (then the
+  fusion into `gate_up` happens on the runtime side) or fuse first and group after.

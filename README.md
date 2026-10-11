@@ -75,10 +75,34 @@ The consequence of the last two rows together is the whole design problem, and i
 
 ## Entry cost
 
-The BF16 source, `mistralai/Mistral-Small-4-119B-2603`: **225.3 GiB, 7 shards** (MEASURED from the HF
-API). Requantizing an existing 2-bit GGUF is **not** an option — `llama-quantize`'s own
-`--allow-requantize` help warns that it "can severely reduce quality". The download is part of the
-entry cost, not an optimisation to defer.
+**Corrected 2026-10-11 by reading the downloaded checkpoint's own headers — the earlier "225.3 GiB
+BF16 source" was wrong on both counts.**
+
+`mistralai/Mistral-Small-4-119B-2603` is a **natively FP8 (E4M3) checkpoint**, not BF16:
+`quantization = {qformat_weight: "fp8_e4m3", qscheme_act: "TENSOR"}`, with the non-converted modules
+(`model.vision_tower`, `model.multi_modal_projector`, `lm_head`) left in BF16 — MEASURED from
+`params.json` and from the shard headers (shard 1: 4824 BF16 + 2395 F8_E4M3 tensors).
+
+| what | measured |
+|---|---|
+| one full copy of the weights | **112.6 GiB** (`total_size` 120,922,7xx,xxx, identical in both index files) |
+| representations shipped | **two**, describing the same weights: `consolidated-*.safetensors` (42,741 tensors) and `model-*.safetensors` (1,485 tensors) |
+| what we downloaded | **242 GB — both copies**, byte-exact vs the HF manifest (34 min at ~64 MB/s) |
+
+**The practical consequence is good news, and it replaces an assumption with a fact:** the earlier
+claim that T1 needs a ~240 GB BF16 download to avoid re-quantizing a 2-bit file was unnecessary.
+`convert_hf_to_gguf.py` handles this checkpoint (`--fp8-as-q8` exists for the FP8 path), and because
+**every E4M3 value maps exactly into F16**, converting with `--outtype f16` reproduces the source
+weights losslessly at ~225 GiB — i.e. the "≥16-bit source" the quantizer needs is obtainable **from
+what is already on disk**, and requantizing the existing IQ2_XXS GGUF remains the invalid option it
+was. (The conversion is a CPU/disk job; it must not run concurrently with a timing measurement.)
+
+**And a structural fact that changes how T2 looks:** the `consolidated` representation carries
+**every expert individually** — `layers.N.experts.N.w1/w2/w3.weight` plus per-expert
+`qscale_weight`/`qscale_act`, 4,608 tensors per projection = 36 layers × 128 experts exactly — where
+the GGUF we run fuses w1+w3 into one `ffn_gate_up_exps` tensor per layer. So the source does not have
+the "one type per tensor" problem we are solving for the *runtime* file, and it already carries
+per-expert weight scales. See `layout.md` §6.
 
 ## Non-goals
 
