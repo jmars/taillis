@@ -1,0 +1,8 @@
+# Source weights and quantized outputs are large; never committed.
+models/
+venvs/
+logs/
+results/*.gguf
+*.gguf
+__pycache__/
+*.pyc
