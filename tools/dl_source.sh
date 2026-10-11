@@ -9,6 +9,11 @@ REPO="mistralai/Mistral-Small-4-119B-2603"
 DEST="$HERE/models/Mistral-Small-4-119B-2603"
 mkdir -p "$DEST" "$HERE/logs"
 
+# hf_transfer does multi-connection chunked downloads; MEASURED 2026-10-11: plain
+# huggingface_hub ran at ~5 MB/s on this host (12h for the 225 GiB source), and HF's
+# own shape on this box has been per-connection shaping before (aubier's lane-D
+# downloader: ~3 MB/s single, 2-31 MB/s per parallel ranged connection).
+export HF_HUB_ENABLE_HF_TRANSFER=1
 exec "$HERE/venvs/hf/bin/python" - "$REPO" "$DEST" <<'PY'
 import sys
 from huggingface_hub import snapshot_download

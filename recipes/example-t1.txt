@@ -1,0 +1,69 @@
+# recipes/example-t1.txt — PROPOSAL — NOT RUN
+#
+# What this is trying to test (one line): whether replacing the flat
+# per-tensor types of the current UD-IQ2_XXS recipe with a workload-imatrix
+# (calibrated on real agent traffic) holds quality at equal or fewer bytes.
+#
+# Status: a first T1 candidate, derived arithmetically from the recipe we
+# already run (see README "What is already known"). No effect is claimed and
+# no run is described here — the imatrix itself has not been collected yet.
+
+# ---------------------------------------------------------------------------
+# The --tensor-type-file format (MEASURED from the pristine baseline,
+# src/llama.cpp/tools/quantize/quantize.cpp:317 parse_tensor_type and :349
+# parse_tensor_type_file):
+#
+#   - One entry per line:  <regex>=<ggml-type>
+#   - The part before '=' is a tensor-name REGEX (compiled with std::regex,
+#     src/llama.cpp/src/llama-quant.cpp — the tensor name is matched against
+#     it; entries are lowercased before use).
+#   - The file is whitespace-split (while (file >> arg)), so the regex must
+#     not contain spaces or tabs.
+#   - Entries are applied in file order; presumably the first match wins
+#     (INTERPRETATION — verify on the first real run with --dry-run).
+#   - Unmatched tensors fall through to the default type chosen from
+#     positional <type> / --output-tensor-type.
+#
+# Verify any recipe cheaply before a real quantize:
+#   llama-quantize <bf16-src> <out> IQ2_XXS --imatrix <f> \
+#       --tensor-type-file recipes/example-t1.txt --dry-run
+# ---------------------------------------------------------------------------
+
+# --- T1 first candidate ----------------------------------------------------
+# Base (what the current UD-IQ2_XXS file already carries, per introspection):
+#   router              blk.N.ffn_gate_inp.weight          F32      x36
+#   attention q         blk.N.attn_q.*.weight              Q8_0     x144
+#   attention k/v       blk.N.attn_k/v.*.weight            Q5_K     x72
+#   attention norms     blk.N.*_norm.weight / output etc.  F32      x108
+#   shared expert       blk.N.ffn_*_shexp.weight           Q6_K/Q5_K
+#   routed experts      blk.N.ffn_gate_up_exps.weight      IQ2_XXS  x36
+#   routed experts      blk.N.ffn_down_exps.weight         IQ3_S x32 / IQ2_S x4
+
+# Router stays F32 — routing logits at 2 bits are the cheapest place to lose
+# expert selection, and 36 tensors of (4096,128) is ~75 MiB total.
+^blk\.[0-9]+\.ffn_gate_inp\.weight$=f32
+
+# Attention: keep the current allocation (Q8_0 query, Q5_K k/v, F32 norms).
+^blk\.[0-9]+\.attn_q[a-z_]*\.weight$=q8_0
+^blk\.[0-9]+\.attn_k[a-z_]*\.weight$=q5_k
+^blk\.[0-9]+\.attn_v[a-z_]*\.weight$=q5_k
+^blk\.[0-9]+\.[a-z_]*norm[a-z_.]*$=f32
+
+# Shared expert: Q6_K gate/up, Q5_K down (current allocation).
+^blk\.[0-9]+\.ffn_gate_up_shexp\.weight$=q6_k
+^blk\.[0-9]+\.ffn_down_shexp\.weight$=q5_k
+
+# Routed experts: unchanged types at T1 — the imatrix is the treatment, the
+# per-tensor types are the control. The candidate under test keeps the
+# expert-tensor allocation identical to the shipped file so the imatrix's
+# effect is attributable to calibration, not to a type change.
+^blk\.[0-9]+\.ffn_gate_up_exps\.weight$=iq2_xxs
+^blk\.[0-9]+\.ffn_down_exps\.weight$=iq3_s
+
+# NOTE on the IQ3_S x32 / IQ2_S x4 split of ffn_down_exps: which four layers
+# carry IQ2_S in the shipped file was not introspected for this proposal;
+# this candidate applies IQ3_S to all 36 and would therefore differ from the
+# shipped file by those 4 layers unless the split is restored. Restoring it
+# requires four per-layer regexes once the layer indices are known.
+# (That is a deliberate simplification for the first run, stated here so it
+# cannot pass unnoticed.)
