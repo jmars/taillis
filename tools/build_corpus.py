@@ -40,7 +40,18 @@ DEFAULT_SESSIONS = "~/.local/state/hax/sessions"
 DEFAULT_TEMPLATE = str(Path(__file__).resolve().parent.parent
                        / "models/Mistral-Small-4-119B-2603/chat_template.jinja")
 MARKER = "TAILLIS_IMATRIX_PROMPT"
-DEFAULT_BUDGET_BYTES = 8_388_608  # ~2M tokens at the coarse bytes/4 estimate
+# Runaway guard, NOT a token target. The corpus is sized by what the session
+# tree holds -- MEASURED 2026-10-11 the shipped build is 334,751,311 B
+# (~319 MiB / ~83.7M tokens) -- so 1 GiB simply sits above it and the guard
+# never binds; `--budget-bytes` remains the only thing that shapes size. (The
+# ctx's 373.4 MiB / ~97.9M tokens is the *record text available* before
+# rendering; the chat template's structure accounts for the difference.)
+# NOTE: 0 does NOT disable the guard -- the loop below always keeps the first
+# conversation (`and n_conv > 0`), so 0 yields a one-conversation corpus. That
+# behaviour predates this change and is left alone rather than redefined under
+# cover of a re-tune; the manifest's `budget_bytes`/`budget_exhausted` are
+# likewise unchanged.
+DEFAULT_BUDGET_BYTES = 1_073_741_824
 
 # Per-record character caps. Tool outputs dominate raw transcript bytes (the
 # median tool_result is small but the tail is huge); the budget is spent on
@@ -52,7 +63,14 @@ CAPS = {
     "tool_call": 4000,
     "tool_result": 2000,
 }
-CONVERSATION_CAP = 24_000  # chars of rendered body per conversation
+# Chars of rendered body per conversation. This is a bound on the single-session
+# OUTLIER, not a budget shaper: the largest session in the tree renders to
+# ~22.1 MB uncapped on its own -- 6% of the 373.4 MiB uncapped total, 0.3% of the
+# shipped corpus -- and a cap below that spends the corpus on one session.
+# MEASURED 2026-10-11 the old 24,000 value was the DOMINANT limiter: it cut
+# 373.4 MiB of available record text to 26.3 MiB while the byte budget never
+# bound. At 1 MiB it truncated 16 of the 1360 sessions in the shipped corpus.
+CONVERSATION_CAP = 1_048_576
 
 # ---------------------------------------------------------------------------
 # Redaction. Ordered list of (compiled regex, replacement). Each match is
@@ -302,8 +320,37 @@ def build(sessions_dir: Path, out_txt: Path, out_manifest: Path,
     by_source: dict[str, list[Path]] = {}
     for p in files:
         by_source.setdefault(str(p.parent.relative_to(sessions_dir)), []).append(p)
+    # Per-source emission order. It matters because `llama-imatrix --chunks N`
+    # takes a PREFIX of this file (imatrix.cpp:1464-1466 sets
+    # n_chunk = min(n_chunks, tokens/n_ctx); :1491 walks `start = i*n_ctx` for
+    # the first n_chunk chunks; only --chunk/--from-chunk moves the window), so
+    # whatever this order is, it is what a chunk budget samples.
+    #
+    # The old chronological `lst.sort()` made a prefix the BEGINNING of each
+    # project's history: hax session filenames are timestamps, and per-source
+    # counts are lopsided (280/269/127/92/72... conversations). MEASURED
+    # 2026-10-11 on a 337 MB / 1368-conversation corpus: 500 chunks (~2.05M
+    # tokens, ~2.5% of the corpus) reached 36 conversations from 36 of the 52
+    # sources and EVERY ONE of them that source's oldest session.
+    #
+    # Ordering each source by sha256 of its relative path -- the same string the
+    # marker rid below is derived from -- is a fixed uniform permutation over
+    # that source, so the r-th rotation draws a spread session from every source
+    # rather than its r-th oldest. What a prefix samples is still bounded by the
+    # cross-source round-robin: MEASURED 2026-10-11 on the shipped corpus, the
+    # first 500 chunks (~2.05M tokens) reach 40 conversations from 40 of the 52
+    # sources, and ALL 52 sources appear only from ~665 chunks (~10.9 MB). So the
+    # claim is narrow and it is the one that matters -- a prefix draws a session
+    # spread over each reached source's history (mean within-source rank 0.527,
+    # was 0.000), NOT that every prefix covers the whole tree. Determinism is
+    # required: a path hash, never `random` and never the salted built-in `hash()`.
+    #
+    # The cross-source round-robin below is UNCHANGED -- it is what stops one
+    # project from consuming the corpus before the others are reached, and that
+    # property has to survive this change.
     for lst in by_source.values():
-        lst.sort()
+        lst.sort(key=lambda p: hashlib.sha256(
+            str(p.relative_to(sessions_dir)).encode()).hexdigest())
     queues = [by_source[k] for k in sorted(by_source)]
     order = []
     while queues:

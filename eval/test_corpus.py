@@ -14,7 +14,17 @@ read), runs the builder over it, and asserts:
      the truncated render fits the cap, is a prefix of the uncapped render of
      the same conversation, and dropped whole trailing messages with no partial
      block at the end. This is the part that would have caught the shipped
-     defect (render_template had no cap at all while render_plain did).
+     defect (render_template had no cap at all while render_plain did). Part 7
+     pins CONVERSATION_CAP to its own TEST_CAP, so it does not go tautological
+     when the module default moves.
+  8. the EMISSION ORDER makes any PREFIX of the corpus a spread sample:
+     `llama-imatrix --chunks N` takes a prefix, so the builder must not emit
+     each source chronologically. Builds a synthetic multi-source tree and
+     asserts (a) the first rotation hits every source exactly once (the
+     cross-source round-robin survived), (b) the emitted order is NOT the
+     chronological round-robin order -- and not chronological within any
+     source either, and (c) two builds over the same fixture agree. Fails on a
+     builder that sorts a source chronologically.
 
 Part 7 needs jinja2 and runs in-process when jinja2 is importable; the system
 python3 does not have it, so otherwise the part is delegated to
@@ -29,18 +39,27 @@ The failing-before / passing-after asymmetry:
     python3 eval/test_corpus.py --no-redact   # must FAIL (exit != 0)
     python3 eval/test_corpus.py               # must PASS (exit 0)
 
-  template-cap check (--builder loads an alternate build_corpus.py; HEAD's copy
-  is the pre-fix renderer, which has no cap):
-    git show HEAD:tools/build_corpus.py > /tmp/prefix_build_corpus.py
+  template-cap check (--builder loads an alternate build_corpus.py; the pre-fix
+  renderer is the revision BEFORE 6c82f77, which had no cap in render_template.
+  MEASURED 2026-10-11: `git show HEAD:…` is NOT a valid pre-fix arm -- HEAD
+  044753c already carries 6c82f77's fix, so that gate exits 0 and cannot fail):
+    git show 6c82f77^:tools/build_corpus.py > /tmp/prefix_build_corpus.py
     venvs/corpus/bin/python3 eval/test_corpus.py --template-cap-only \\
         --builder /tmp/prefix_build_corpus.py   # must FAIL (exit != 0)
     venvs/corpus/bin/python3 eval/test_corpus.py --template-cap-only  # PASS (0)
+
+  emission-order check (part 8; the pre-fix builder is any revision BEFORE this
+  change, i.e. one whose per-source order is `lst.sort()`):
+    python3 eval/test_corpus.py --builder /tmp/pre_change_build_corpus.py
+                                                                 # must FAIL (!= 0)
+    python3 eval/test_corpus.py                                  # must PASS (0)
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -122,17 +141,39 @@ def write_long_fixture(root: Path) -> Path:
     return f
 
 
+# The cap part 7 exercises, set EXPLICITLY rather than inherited from the module
+# default. The default is sized for real sessions (1 MiB) and write_long_fixture
+# renders to ~97,410 chars uncapped (MEASURED 2026-10-11), so a part that read the
+# default would have its length assertions degenerate into tautologies as soon as
+# the default moved above the fixture -- the AGENTS.md "a test that cannot fail"
+# hazard. Pinning the cap here keeps the part INDEPENDENT OF THE MODULE DEFAULT:
+# it still fails on a builder with no cap and on one that byte-slices the render.
+# Nothing is weakened -- all checks below (fits the cap, prefix property,
+# complete-message-block tail, whole-message drop, equal-to-prefix-render) remain.
+TEST_CAP = 30_000
+
+
 def run_template_cap_part() -> None:
     """Part 7: message-granular capping on the template arm.
 
-    Runs against bc.render_template. On the pre-fix module (no cap at all) the
-    length assertion fails; on a byte-slicing implementation the prefix
+    Runs against bc.render_template with CONVERSATION_CAP pinned to TEST_CAP
+    (saved and restored around the part). On the pre-fix module (no cap at all)
+    the length assertion fails; on a byte-slicing implementation the prefix
     assertion fails.
     """
     if not TEMPLATE.exists():
         check("template-arm cap: template present", False, f"missing {TEMPLATE}")
         return
 
+    saved_default = bc.CONVERSATION_CAP
+    bc.CONVERSATION_CAP = TEST_CAP
+    try:
+        _template_cap_checks()
+    finally:
+        bc.CONVERSATION_CAP = saved_default
+
+
+def _template_cap_checks() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         fixture = write_long_fixture(root)
@@ -196,6 +237,123 @@ def run_template_cap_part() -> None:
               "[TRUNCATED]" not in capped)
 
 
+# ---------------------------------------------------------------------------
+# Part 8: emission order -> any prefix of the corpus is a spread sample
+# ---------------------------------------------------------------------------
+
+SPREAD_SOURCES = ("src-a", "src-b", "src-c", "src-d")
+SPREAD_PER_SOURCE = 8
+SPREAD_TOKEN_RX = re.compile(r"SPREADTOKEN-(src-[a-z])-(\d+)")
+
+
+def spread_token(src: str, i: int) -> str:
+    return f"SPREADTOKEN-{src}-{i:02d}"
+
+
+def spread_fixture_name(i: int) -> str:
+    """Fixture session filename; its timestamp ascends with i, so lexicographic
+    (chronological) order == index order -- the property the index-based
+    comparisons below rely on, asserted rather than assumed."""
+    return f"2026-01-01T00-00-{i:02d}Z_session-{i}.jsonl"
+
+
+def write_spread_fixture(root: Path) -> dict[str, list[str]]:
+    """Several SOURCES of several SESSIONS each, one session per file, every
+    session carrying a unique token in its body.
+
+    Returns, per source, that source's sessions in the order a chronological
+    builder emits them (`Path.sort()` == lexicographic by filename, and the
+    fixture filenames are timestamps in index order, as the real ones are).
+    """
+    chronological: dict[str, list[str]] = {}
+    for src in SPREAD_SOURCES:
+        d = root / src
+        d.mkdir()
+        names = []
+        for i in range(SPREAD_PER_SOURCE):
+            name = spread_fixture_name(i)
+            records = [
+                {"type": "session", "hax_version": "v0.5.0", "id": f"{src}-{i}",
+                 "cwd": f"/tmp/{src}", "model": "test-model"},
+                {"kind": "user", "text": f"one unique spread token {spread_token(src, i)}"},
+                {"kind": "assistant", "text": "acknowledged"},
+            ]
+            (d / name).write_text("\n".join(json.dumps(r) for r in records) + "\n",
+                                  encoding="utf-8")
+            names.append(name)
+        chronological[src] = sorted(names)
+    return chronological
+
+
+def emitted_spread_order(text: str) -> list[tuple[str, int]]:
+    """The (source, session index) sequence the corpus emitted, in file order."""
+    return [(m.group(1), int(m.group(2))) for m in SPREAD_TOKEN_RX.finditer(text)]
+
+
+def chronological_order(chronological: dict[str, list[str]]) -> list[tuple[str, int]]:
+    """The order a per-source-chronological builder emits: rotation r takes the
+    r-th oldest session of every source."""
+    srcs = sorted(chronological)
+    out = []
+    for r in range(max(len(v) for v in chronological.values())):
+        for src in srcs:
+            if r < len(chronological[src]):
+                out.append((src, r))  # filename index order == chronological order
+    return out
+
+
+def run_spread_part() -> None:
+    """Part 8: the emission order makes any PREFIX a spread sample.
+
+    `llama-imatrix --chunks N` takes a prefix of corpus/agent_sessions.txt, so
+    the order the builder emits IS what a chunk budget samples. The pre-change
+    builder sorted each source chronologically, making a prefix the oldest
+    session of each source and nothing else.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        chronological = write_spread_fixture(root)
+        out1, man1 = root / "spread-1.txt", root / "spread-1.json"
+        m1 = bc.build(root, out1, man1, template_path=None, budget_bytes=10**7)
+        order1 = emitted_spread_order(out1.read_text(encoding="utf-8"))
+
+        n_src = len(chronological)
+        n_sess = sum(len(v) for v in chronological.values())
+        check("spread: fixture is set up so chronological order is index order",
+              all(chronological[src] == [spread_fixture_name(i) for i in range(len(chronological[src]))]
+                  for src in chronological),
+              "fixture filenames do not sort in index order")
+        check("spread: every session emitted exactly once",
+              len(order1) == n_sess == m1["conversation_count"]
+              and len(set(order1)) == n_sess,
+              f"emitted={len(order1)} unique={len(set(order1))} "
+              f"expected={n_sess} manifest={m1['conversation_count']}")
+
+        # (a) the cross-source round-robin survived: the first rotation draws
+        # one conversation from every source, exactly once each.
+        first = [src for src, _ in order1[:n_src]]
+        check("spread: the first rotation hits every source exactly once",
+              sorted(first) == sorted(chronological),
+              f"first_rotation={first}")
+
+        # (b) the discriminating check -- fails on the pre-change builder.
+        check("spread: emitted corpus order differs from the chronological order",
+              order1 != chronological_order(chronological),
+              "emitted order IS the chronological round-robin order")
+
+        ident = [src for src, names in chronological.items()
+                 if [i for s, i in order1 if s == src] == list(range(len(names)))]
+        check("spread: no source is emitted in chronological order",
+              not ident, f"chronological within {ident}")
+
+        # (c) determinism: the same tree gives the same order.
+        out2, man2 = root / "spread-2.txt", root / "spread-2.json"
+        bc.build(root, out2, man2, template_path=None, budget_bytes=10**7)
+        order2 = emitted_spread_order(out2.read_text(encoding="utf-8"))
+        check("spread: a second build gives the identical order",
+              order2 == order1, f"n1={len(order1)} n2={len(order2)}")
+
+
 def run_all() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -256,6 +414,9 @@ def run_all() -> int:
         else:
             check("template-arm cap", False,
                   f"jinja2 absent and {VENV_PYTHON} not found")
+
+    # Part 8: the emission order (any prefix of the corpus is a spread sample).
+    run_spread_part()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")

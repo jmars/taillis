@@ -364,3 +364,32 @@ fix. Two measurements settle it:
    detection** (still bounded by the pattern list) — residual scan over the new
    corpus, all zero: `sk-`, `ghp_`, `AKIA`, `hf_`, `gsk_`, `xox[bpars]-`,
    JWT-ish, `://user:pass@`, PEM, bare `bearer`.
+
+## SUPERSEDED — appended 2026-10-11 (orchestrator), not a rewrite
+
+Every corpus number above describes a corpus that no longer exists. This
+document is the historical record of unit `taillis-t1c`; the values are kept as
+measured then and are **not** the current corpus. The supersession is unit
+`taillis-t13corpus` (report on `handoff-taillis-t13corpus-result`), which
+re-set the builder's two limits — `CONVERSATION_CAP` 24,000 → 1,048,576 and
+`DEFAULT_BUDGET_BYTES` 8,388,608 → 1,073,741,824 (now a runaway guard, not a
+token target) — and rebuilt from the whole session tree. Unit `taillis-t13sample`
+then made a second, narrower change: the within-source emission order was
+chronological, so a `--chunks N` PREFIX of the corpus drew each source's OLDEST
+session; it is now a sha256-of-relative-path order. That change is a **pure
+permutation** — proven by building one frozen snapshot with both builders:
+**identical byte count, different sha256**. The corpus as it now stands:
+
+**1368 conversations / 52 sources / 5230 turns / 337,447,903 B (~322 MiB) /
+~84M tokens / 0 parse errors**, sha256 `813dbc12…9cde`. Supersedes the
+334,751,311 B / `1733902e…2511` (1360-conv) build, which in turn superseded
+`cb37d019…c606` / 452 conversations / 8,379,965 B. First 500 chunks now cover 40
+conversations from 40 sources at mean within-source rank 0.525 (was 36/36 at
+rank 0.000).
+
+The 24,000-char cap, not the byte budget, was the dominant limiter (it cut
+373.4 MiB of available record text to 26.3 MiB). The `t1-f16`-era references
+elsewhere to `cb37d019…c606` / 452 conversations / 2,094,991 tokens are the
+superseded build. The per-record `CAPS` were deliberately **not** re-tuned, so
+the composition argument in §"Per-record caps" above still describes the
+current build's shaping; only the two limits and the order moved.
