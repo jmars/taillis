@@ -55,15 +55,48 @@ echo "== venv      :"
 CMD=("$PY" "$CONVERTER" "$SRC" --outtype f16 --outfile "$OUT")
 
 echo "== STEP 1: arch gate (--dry-run; reads all shard headers, writes nothing)"
+# nanosecond mtime + size: %Y alone is 1-second resolution, so a same-second
+# rewrite of a pre-existing artifact could pass the unchanged-check
+OUT_BEFORE=$(stat -Lc '%.9Y %s' "$OUT" 2>/dev/null || true)
 "${LAUNCH[@]}" "${CMD[@]}" --dry-run 2>&1 | tee logs/t12-dryrun.log | tail -5
 grep -q 'n_tensors = 579' logs/t12-dryrun.log || die "unexpected dry-run plan"
-[ -e "$OUT" ] && die "--dry-run created $OUT"
+# the gate is: the dry-run WROTE NOTHING.  A pre-existing artifact from an
+# earlier build must not trip it — absence alone was the wrong predicate
+# (it made every --gate-only run after T1.2 die here).
+if [ -n "$OUT_BEFORE" ]; then
+  [ "$(stat -Lc '%.9Y %s' "$OUT")" = "$OUT_BEFORE" ] || die "--dry-run modified $OUT"
+else
+  [ -e "$OUT" ] && die "--dry-run created $OUT"
+fi
 echo "   gate: 579 tensors planned, no file written."
 
-if [ "${1:-}" = "--gate-only" ]; then echo "== --gate-only: stopping before the write"; exit 0; fi
+# STEP 3 (R1, layout.md §7): stamp the provenance keys onto the fresh artifact.
+# FUTURE builds only — the on-disk F16 is never rewritten to add keys (layout.md
+# §7.3: the existing artifact is documented, not modified).  taillis.parent_sha256
+# is NOT stamped here: a flat converted file has no grouped parent; group_experts.py
+# stamps it when the file is later regrouped.  dl_source.sh snapshot_download()ed
+# the repo without a revision pin, so the revision recorded is the branch.
+SOURCE_CHECKPOINT="mistralai/Mistral-Small-4-119B-2603@main"
+# format_version = 0, NOT 1: under layout.md §8.1 the value 1 means "the grouping
+# is derived from the member tensor names" — a flat converted file is v0 (absent
+# would mean the same; 0 says so explicitly).  group_experts.py stamps the 1 when
+# the file is later regrouped with --format v1.
+STAMP_CMD=(venvs/convert/bin/python3 tools/stamp_gguf.py --file "$OUT"
+           --set-u32 taillis.format_version=0
+           --set-str "taillis.provenance.source_checkpoint=$SOURCE_CHECKPOINT"
+           --set-str "taillis.provenance.converter=convert_hf_to_gguf.py@$PINNED_COMMIT")
+
+if [ "${1:-}" = "--gate-only" ]; then
+  echo "== --gate-only: stopping before the write; the STEP 3 stamp would run:"
+  echo "   CMD: ${STAMP_CMD[*]}"
+  exit 0
+fi
 
 echo "== STEP 2: conversion (~221.6 GiB; tens of minutes to a few hours)"
 printf 'CMD: %s\nSTART: %s\n' "${CMD[*]}" "$(date -Is)" > logs/t12-convert.log
 "${LAUNCH[@]}" "${CMD[@]}" >> logs/t12-convert.log 2>&1
 echo "END: $(date -Is)" >> logs/t12-convert.log
 echo "== done: $(ls -l "$OUT")"
+
+echo "== STEP 3: stamp R1 provenance (layout.md §7) onto the fresh artifact"
+"${LAUNCH[@]}" "${STAMP_CMD[@]}"
