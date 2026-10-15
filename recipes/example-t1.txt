@@ -37,7 +37,7 @@
 #   attention norms     blk.N.*_norm.weight / output etc.  F32      x108
 #   shared expert       blk.N.ffn_*_shexp.weight           Q6_K/Q5_K
 #   routed experts      blk.N.ffn_gate_up_exps.weight      IQ2_XXS  x36
-#   routed experts      blk.N.ffn_down_exps.weight         IQ3_S x32 / IQ2_S x4
+#   routed experts      blk.N.ffn_down_exps.weight         IQ2_S x32 / IQ3_S x4  (IQ3_S on layers 4, 28, 32, 35)
 
 # Router stays F32 — routing logits at 2 bits are the cheapest place to lose
 # expert selection, and 36 tensors of (4096,128) is ~75 MiB total.
@@ -58,12 +58,18 @@
 # expert-tensor allocation identical to the shipped file so the imatrix's
 # effect is attributable to calibration, not to a type change.
 ^blk\.[0-9]+\.ffn_gate_up_exps\.weight$=iq2_xxs
-^blk\.[0-9]+\.ffn_down_exps\.weight$=iq3_s
+# The shipped file's down-expert split, restored (MEASURED introspection,
+# aubier docs/TARGET-ARCHITECTURE.md 12.2, re-verified by an independent parse):
+# IQ2_S on 32 layers, IQ3_S on exactly {4, 28, 32, 35}. The SPECIFIC line must
+# come first if first-match-wins holds — verify with --dry-run.
+^blk\.(4|28|32|35)\.ffn_down_exps\.weight$=iq3_s
+^blk\.[0-9]+\.ffn_down_exps\.weight$=iq2_s
 
-# NOTE on the IQ3_S x32 / IQ2_S x4 split of ffn_down_exps: which four layers
-# carry IQ2_S in the shipped file was not introspected for this proposal;
-# this candidate applies IQ3_S to all 36 and would therefore differ from the
-# shipped file by those 4 layers unless the split is restored. Restoring it
-# requires four per-layer regexes once the layer indices are known.
-# (That is a deliberate simplification for the first run, stated here so it
-# cannot pass unnoticed.)
+# NOTE (CORRECTED 2026-10-13, orchestrator): this candidate previously applied
+# IQ3_S to ALL 36 down layers, which contradicted its own stated intent ("keeps
+# the expert-tensor allocation identical to the shipped file") and its header,
+# which had the shipped split INVERTED (IQ3_S x32 / IQ2_S x4) against the
+# MEASURED introspection (IQ2_S x32 / IQ3_S x4 on layers 4, 28, 32, 35 —
+# aubier docs/TARGET-ARCHITECTURE.md 12.2, itself the product of an independent
+# re-parse). Restored above with the specific-first ordering. If --dry-run shows
+# that LAST match wins instead of first, swap the two lines.
