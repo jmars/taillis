@@ -229,9 +229,18 @@ artifacts — §8.4.
 
 ### 8.1 Version dispatch
 
-- **v0** — `taillis.format_version` absent, or present and `0`. The
-  `taillis.expert_groups` string array is present and **is** the declaration (§2
-  semantics, unchanged).
+- **v0** — `taillis.format_version` absent, or present and `0`. Two sub-cases, and the
+  second is the one that matters for artifacts built outside the grouping writer:
+  - the `taillis.expert_groups` string array is present and **is** the declaration
+    (§2 semantics, unchanged); or
+  - **neither the array nor any member-shaped name is present, and the file is simply
+    FLAT** — there is no grouping to declare. A flat artifact must NOT stamp `1`: `1`
+    is a claim about a derived grouping, and a file with no members has none.
+    (Settled 2026-10-18: the first non-grouped artifact we built under R1 stamped `1`
+    because the stamp was specified before this case existed. It is inert either way —
+    the reader derives no members and reads the file flat — but a provenance record
+    that says "grouping derived from member names" about a file that has no grouping
+    is a lie of the same kind this document exists to prevent.)
 - **v1** — `taillis.format_version == 1` (u32). Membership and order are **derived**
   from the tensor table (§8.2), and **`taillis.expert_groups` MUST NOT be present** —
   its presence in a v1 file is itself malformed.
