@@ -104,7 +104,8 @@ except ImportError as e:  # pragma: no cover - environment error, not logic
     sys.exit(f"FATAL: gguf-py not importable ({e}); use venvs/convert/bin/python3")
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_SRC = Path("~/futaie/aubier/models/Mistral-Small-4-119B-2603-UD-IQ2_XXS.gguf")
+DEFAULT_SRC = (Path.home() / "futaie" / "aubier" / "models"
+               / "Mistral-Small-4-119B-2603-UD-IQ2_XXS.gguf")
 GROUP_KEY = "taillis.expert_groups"
 FORMAT_KEY = "taillis.format_version"
 PARENT_KEY = "taillis.parent_sha256"

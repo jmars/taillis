@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Build the taillis T1 calibration corpus for `llama-imatrix`.
 
-Source: this machine's own hax agent session transcripts
-(`~/.local/state/hax/sessions/**/*.jsonl`). One rendered conversation per
+Source: this machine's own agent session transcripts, from the directory named by
+`--sessions` (default: the local session store, overridable by `TAILLIS_SESSIONS`).
+One rendered conversation per
 visible `TAILLIS_IMATRIX_PROMPT` marker, mimicking ds4's
 `DS4_IMATRIX_PROMPT` convention (verified against
 antirez/ds4 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py:
@@ -36,7 +37,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-DEFAULT_SESSIONS = "~/.local/state/hax/sessions"
+DEFAULT_SESSIONS = os.environ.get("TAILLIS_SESSIONS", "~/.local/state/hax/sessions")
 DEFAULT_TEMPLATE = str(Path(__file__).resolve().parent.parent
                        / "models/Mistral-Small-4-119B-2603/chat_template.jinja")
 MARKER = "TAILLIS_IMATRIX_PROMPT"

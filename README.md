@@ -1,133 +1,82 @@
 # taillis
 
-**Per-expert quantization of Mistral Small 4's expert layers.** Bits go where the tokens go.
+**What the weights are.** Bit-level and layout-level decisions about Mistral Small 4's expert
+layers, expressed in a GGUF that [aubier](https://github.com/jmars/aubier) — the engine — reads.
+The interface between the two projects is one file format, specified in [`layout.md`](layout.md).
 
 **Mistral Small 4 is the only target — this is not a general MoE quantizer.** The shapes are known
-(36 all-MoE layers, 128 routed experts of which 4 are active, a fused `ffn_gate_up_exps` and a
-`ffn_down_exps` per layer), so nothing here is built to generalise, and code that would only pay off
-on a second model is not written.
+(36 all-MoE layers, 128 routed experts of which 4 are active, a fused `ffn_gate_up_exps` and an
+`ffn_down_exps` per layer), so nothing here is built to generalise.
 
-Claims in this repo are marked **MEASURED** (with the artifact), **INTERPRETATION**, or
-**PROJECTION**. Anything unmarked is a statement of intent.
-
----
-
-## Why: one of the two reasons is speed, not fidelity
-
-1. **Quality.** Today every one of a layer's 128 experts shares a single type, because the GGUF
-   carries one type per tensor. Experts carry very different numbers of tokens, so they should not
-   all be quantized as if they did.
-2. **Bytes are a residency variable.** In the engine ([aubier](https://github.com/jmars/aubier)), each
-   layer's experts are **split by where their weights live** and computed concurrently. That design
-   has a balance point `f` (the resident fraction) that moves with every byte of expert weight:
-   **MEASURED arithmetic** in aubier's `docs/TARGET-ARCHITECTURE.md` §11 puts `f ≈ 0.58` at the ideal
-   for one 16 GB card. Shrinking the expert set, or keeping the same size but protecting it better,
-   buys residency — which is throughput.
-
-So this is the representation half of a running engine, not a size-reduction exercise for its own sake.
+Claims are marked **MEASURED** (with the artifact), **INTERPRETATION**, or **PROJECTION**.
+Anything unmarked is intent. A gate is an **exit code**, never the tail of stdout. A fix is proved
+by **asymmetry** — it must fail before and pass after.
 
 ---
 
-## Where this sits
+## What this is working on now: variant (LoRA) swap
 
-`aubier` owns **where the weights live and who computes them**. `taillis` owns **what the weights
-are**. The interface between them is a single GGUF file, specified in [`layout.md`](layout.md).
+A trained adapter is exported as an **OVERLAY** file and swapped in at load time: the overlay
+replaces a chosen set of `(layer, expert)` weight slices, while the base model, the router tensors
+it does not override, the shared expert, attention and the KV path stay untouched.
 
----
+The format problem is real and narrow. A GGUF carries one type per tensor, and a variant's experts
+need to be addressable as a unit *by the engine*, without a side file. `layout.md` **V4** specifies
+the overlay class:
 
-## Status: stage 0 — scaffold. Nothing here is measured yet.
+- `.ov<k>` override tensors, either an **expert slice** (`ne[2] == len(experts)`) or a **whole
+  tensor** — the kind is derived from the base tensor's rank, never declared;
+- **the manifest lives in the file**, not in a side JSON: the expert list is one scalar key per
+  tensor, bound to the `k` already in the tensor name; the target group and the type are *derived*
+  and then checked. Declaring them twice is how a format grows a second thing that can disagree
+  with the first;
+- `taillis.parent_sha256` names the base, so a comparator is a property of the artifact.
 
-Two stages, split because the first needs no engine change and the second does.
+`tools/repack_overlay.py` is the exporter (S1 of aubier's plan): it cuts rows out of a base GGUF,
+writes them back as an overlay, and proves the round trip byte-for-byte — on a flat base *and* on a
+grouped one, with an uneven tiling so that "the segments come from the base's own declaration"
+cannot be confused with "the segments were assumed to be even".
 
-### T1 — workload imatrix + per-tensor-type recipe (works with unmodified `llama.cpp`)
+## What was measured and then dropped
 
-Collect activation importance with `llama-imatrix` over **agent-shaped traffic** — and this project
-has an unusually on-target calibration corpus already on disk: real agent session transcripts
-(`~/.local/state/hax/sessions/**/*.jsonl`). Then one `llama-quantize --imatrix <f>
---tensor-type-file <recipe>` run from the BF16 source.
+The project began as a byte-reduction campaign: fewer bytes per expert, because in the engine bytes
+are a residency variable and the CPU miss path is at the memory ceiling. **That campaign is
+concluded, negatively, and the number is the result:**
 
-This stage is fork-independent, is a serial consumer of the same GPU the engine work uses, and
-produces a shippable recipe even if T2 never lands.
+| what we measured | result |
+|---|---|
+| a **−23.5 %** expert-byte cut, uniform, on the product path | **+14.69 % relative perplexity** (2,391 paired positions; CI [+0.089, +0.181]). That is **9.20 %PPL per MiB/expert removed** against a 1.25 bar. It would have bought +2.2 tok/s |
+| a **workload imatrix** vs a uniform one at equal bytes | **+0.252 % PPL** — a tight null at this quant level, and therefore not a lever that can recover 14.7 points |
+| per-expert routing hot sets | **concentrated and request-general on agentic streams** (zero collapse in 15,312 pair verdicts at the single-conversation unit), but contiguous grouping averages the signal away — the hottest *contiguous* chunk is only 1.26× the coldest at G=3 — and every grouping costs the engine more in store graphs than the bytes save |
 
-### T2 — per-expert / per-group types (needs `layout.md` plus a loader extension in aubier)
+So: the quality price of a byte cut at this level is real and large, and the allocation machinery
+that was meant to afford it is worth a quarter of a point. That is why the work moved to variants,
+which change **which weights an expert uses**, not how many bytes it occupies.
 
-Group a layer's expert axis into a few classes by measured routing hotness, give each class its own
-type, and let the engine treat each group as a store it already knows how to compute and sum. The
-hard part is *expressing* it: see `layout.md`.
+## What is in here
 
----
+| path | what |
+|---|---|
+| [`layout.md`](layout.md) | **the format.** Grouped experts (R2), provenance and the version scalar (R1), the comparison chain (R3), and the overlay/variant class (V4) |
+| `tools/` | the writers and checkers: `group_experts.py`, `stamp_gguf.py`, `check_chain.py`, `repack_overlay.py`, plus the corpus/imatrix/slice tools |
+| `eval/` | self-tests. Each is written to be able to fail; several exist because an earlier version could not |
+| `results/` | the write-ups behind the numbers above, with their evidence |
+| `recipes/` | a machine-readable per-tensor-type recipe |
+| `corpus/` | the builder for the calibration corpus — **the corpus itself is private and is not committed** |
 
-## What is already known (all MEASURED elsewhere; carried here so nobody re-derives it)
+## Known facts carried here so nobody re-derives them
 
 | fact | where it was measured |
 |---|---|
-| Our current recipe is already heterogeneous per tensor: router `F32`×36, attention `Q8_0`×144/`Q5_K`×72/`F32`×108, shared expert `Q6_K`×36/`Q5_K`×72, **`ffn_gate_up_exps` `IQ2_XXS`×36**, **`ffn_down_exps` `IQ3_S`×32, `IQ2_S`×4** | introspected from `UD-IQ2_XXS` |
-| Expert tensor shapes: `ffn_gate_up_exps` `(4096, 4096, 128)`, `ffn_down_exps` `(2048, 4096, 128)`, router `(4096, 128)` | introspected from `UD-IQ2_XXS` |
-| **ds4 does NOT allocate bits per expert.** Its `add_experts()` assigns one type across all 288 experts; what varies per expert in ds4 is the *imatrix weighting* | `antirez/ds4` `gguf-tools/glm53_quantize.py`, `gguf-tools/imatrix/README.md` |
-| ds4's measured imatrix payoff, Q4 routed experts, 100 continuations: avg NLL **0.177357819 → 0.173895148 (−1.95% rel)**, case wins 54/46. Vendor-reported, not reproduced here — **this is the honest prior, and it is small** | `antirez/ds4` README |
-| A **static** hot-expert set is dead on this model; the hot set **rotates** | aubier routing trace |
-| GGUF carries **one type per tensor**; `llama-quantize --tensor-type` addresses whole tensors | `llama-quantize --help` |
-
-The consequence of the last two rows together is the whole design problem, and it is stated in
-`layout.md`.
-
----
-
-## Entry cost
-
-**Corrected 2026-10-11 by reading the downloaded checkpoint's own headers — the earlier "225.3 GiB
-BF16 source" was wrong on both counts.**
-
-`mistralai/Mistral-Small-4-119B-2603` is a **natively FP8 (E4M3) checkpoint**, not BF16:
-`quantization = {qformat_weight: "fp8_e4m3", qscheme_act: "TENSOR"}`, with the non-converted modules
-(`model.vision_tower`, `model.multi_modal_projector`, `lm_head`) left in BF16 — MEASURED from
-`params.json` and from the shard headers (shard 1: 4824 BF16 + 2395 F8_E4M3 tensors).
-
-| what | measured |
-|---|---|
-| one full copy of the weights | **112.6 GiB** (`total_size` 120,922,7xx,xxx, identical in both index files) |
-| representations shipped | **two**, describing the same weights: `consolidated-*.safetensors` (42,741 tensors) and `model-*.safetensors` (1,485 tensors) |
-| what we downloaded | **242 GB — both copies**, byte-exact vs the HF manifest (34 min at ~64 MB/s) |
-
-**The practical consequence is good news, and it replaces an assumption with a fact:** the earlier
-claim that T1 needs a ~240 GB BF16 download to avoid re-quantizing a 2-bit file was unnecessary.
-`convert_hf_to_gguf.py` handles this checkpoint (`--fp8-as-q8` exists for the FP8 path), and because
-**every E4M3 value maps exactly into F16**, `--outtype f16` needs no requantization — every fp8 code
-and its scale survive exactly.
-
-The store is *not* bit-lossless, and the earlier "reproduces the source weights losslessly" was an
-overclaim: the dequantized value is rounded to F16. **MEASURED 2026-10-11 over two full routed-expert
-tensors** (~3.2e9 elements): 11.8–14.8% of elements round, maximum **absolute** error 1.2e-4 = f16's
-half-ulp at those magnitudes — three orders of magnitude below the error any 2–4 bit quantization
-introduces, so it is immaterial *here*, but it is rounding, not losslessness.
-
-**And it is now built and verified, not merely obtainable (T1.2, 2026-10-11):**
-`models/Mistral-Small-4-119B-2603-f16.gguf` — **221.647 GiB** (not ~225), `general.architecture =
-mistral4`, 579 tensors, tensor table identical in names and shapes to the IQ2_XXS GGUF we run, fp8
-dequantization proved exact elementwise with a working negative control, and the artifact loads and
-generates. Details and the cannot-verify list: `results/t1-f16.md`. Requantizing the existing
-IQ2_XXS GGUF remains the invalid option it was. (The conversion is a CPU/disk job; it must not run
-concurrently with a timing measurement.)
-
-**And a structural fact that changes how T2 looks:** the `consolidated` representation carries
-**every expert individually** — `layers.N.experts.N.w1/w2/w3.weight` plus per-expert
-`qscale_weight`/`qscale_act`, 4,608 tensors per projection = 36 layers × 128 experts exactly — where
-the GGUF we run fuses w1+w3 into one `ffn_gate_up_exps` tensor per layer. So the source does not have
-the "one type per tensor" problem we are solving for the *runtime* file, and it already carries
-per-expert weight scales. See `layout.md` §6.
+| the source checkpoint is **natively FP8 (E4M3)**, not BF16, and every E4M3 value maps exactly into F16 | its `params.json` and shard headers |
+| the F16 GGUF we run is **221.647 GiB**, arch `mistral4`, 579 tensors | `results/t1-f16.md` |
+| our recipe is already heterogeneous per tensor: router `F32`×36, attention `Q8_0`/`Q5_K`/`F32`, shared expert `Q6_K`/`Q5_K`, **`ffn_gate_up_exps` `IQ2_XXS`×36**, **`ffn_down_exps` `IQ3_S`×32 / `IQ2_S`×4** | introspected from the shipped `UD-IQ2_XXS` |
+| the quantization block axis is `ne[0]`, so slicing along `ne[2]` never disturbs a block — which is what makes any group, and any overlay, carry an arbitrary type | `layout.md` §1 |
+| requantizing an existing 2-bit GGUF is invalid (`llama-quantize --allow-requantize` says so itself); every artifact here is built from the F16 | `llama-quantize --help` |
 
 ## Non-goals
 
-- Not a general MoE quantizer, and not support for any model other than Mistral Small 4.
+- Not a general MoE quantizer, and not support for any model but Mistral Small 4.
 - Not a re-quantization of the existing GGUFs.
-- Not a size chase: the target is **equal quality at fewer bytes, or more quality at equal bytes**.
-- Not a speed claim. Every recipe is evaluated on the engine's pinned configuration and its **speed
-  is recorded alongside its quality**, because mixing types inside a layer changes which GPU kernel
-  path is selected (`get_mmvq_mmid_max_batch` is batch- and type-dependent in aubier's backend).
-
-## Discipline
-
-Same as the rest of the system: a gate is an **exit code**, never the tail of stdout; a fix is proved
-by **asymmetry** (fails before, passes after); the engine's **pinned configuration is the control**
-for every comparison, with the harness noise floor measured in-session; and no claimed number is
-reported without the artifact that produced it.
+- Not a speed claim. Grouping and type mixing change which kernel runs, so any speed effect is a
+  measurement, not an assumption — and in both directions.

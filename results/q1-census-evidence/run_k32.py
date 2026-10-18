@@ -7,7 +7,8 @@ rule's own docstring classifies as 'reported, not gated' and which Stage A++
 measured as a deterministic Monte-Carlo abort (t22b_run.log FATAL at decode
 k=64 L0). No other name in the module is rebound."""
 import sys
-sys.path.insert(0, "~/futaie/taillis/tools")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 import t22b_cross_request as rule
 assert rule.K_ALL == (8, 16, 32, 64)
 rule.K_ALL = (8, 16, 32)
