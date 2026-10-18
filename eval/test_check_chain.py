@@ -315,8 +315,12 @@ def main() -> int:
 
         print("part 2: the uniform shadow, built by the REAL group_experts.py")
         shadow = tmp / "shadow.gguf"
+        # --format v0 is EXPLICIT, not the default: part 8 below asserts the v0
+        # declaration path, and the writer's default is v1 (layout.md §8.4). A case
+        # that leaned on the default changed meaning silently when the default moved.
         cp = subprocess.run([sys.executable, str(GROUPER), "--src", str(flat),
-                             "--out", str(shadow), "--spec", "43,43,42"],
+                             "--out", str(shadow), "--spec", "43,43,42",
+                             "--format", "v0"],
                             capture_output=True, text=True)
         check("group_experts build exits 0", cp.returncode == 0, cp.stdout + cp.stderr)
         fd2 = os.open(shadow, os.O_RDONLY)
