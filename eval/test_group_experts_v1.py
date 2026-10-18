@@ -10,9 +10,14 @@ then drives tools/group_experts.py as a subprocess and asserts:
      with ne[2] = 43+43+42 = 128 and no flat expert tensor survives, and
      --verify --format v1 passes (byte-conservation gates 1/5 against the flat
      fixture, R1 parent_sha256 == sha(src));
-  2. v0 build on the SAME fixture: the key is present exactly as today (6
-     entries), format_version == 0 (the pre-R2 writer stamped 1; reclaimed,
-     layout.md §8.1), and --verify (default v0) passes;
+  1b. the DEFAULT format (no --format at all) is v1 — layout.md §8.3/§8.4: the
+     writer emits format_version == 1 with no group key, and --verify with no
+     --format accepts it. The one case that must NOT pass an explicit flag,
+     because the default IS the thing under test;
+  2. v0 build on the SAME fixture (--format v0, EXPLICIT — see below): the key is
+     present exactly as today (6 entries), format_version == 0 (the pre-R2
+     writer stamped 1; reclaimed, layout.md §8.1), and --verify --format v0
+     passes;
   3. every malformed fixture from tools/make_malformed_grouped.py (the two v0
      and the four v1 ones) is REFUSED as a group_experts SOURCE — member-shaped
      tensor names mean "not a flat parent", which holds for v0 sources (key +
@@ -22,11 +27,16 @@ then drives tools/group_experts.py as a subprocess and asserts:
      this side, and the output says so rather than pretending to test one;
   4. --verify dispatch NEGATIVES: a v1 output with the group key re-added must
      exit 1 naming the key; a v0 output verified as v1 must exit 1; a v1
-     output verified as v0 (the default) must exit 1; and two members'
+     output verified as v0 (--format v0, EXPLICIT) must exit 1; and two members'
      PAYLOAD SLABS exchanged (equal-size g0/g1, layout untouched) must fail
      gate 1 naming the payload sha mismatch — the derived ascending-k order is
      exactly the seam §8 exists to close, so the byte comparison along it must
      have teeth.
+
+Every case except 1b passes --format EXPLICITLY, so no assertion changes meaning
+when a default moves (2026-10-18: the default did move, v0 -> v1, layout.md §8.4;
+this test was written against explicit flags and only case 2/4's absent-flag
+shortcuts had to be made explicit).
 
 The v1 key-re-add rewrite copies every KV and tensor payload verbatim (byte
 gates still pass), so the ONLY failing gate is the v1 key-present one — the
@@ -38,10 +48,14 @@ No GPU, no model file, runs in a temp dir under /tmp.
 
 Gate: this process's exit code. 0 = pass, nonzero = fail.
 
-Failing-before / passing-after asymmetry for the v0 default: the pre-R2 tool
-had no --format flag at all (`--format` → argparse error, exit 2), and its v0
-output stamped format_version = 1, which THIS test asserts is 0 — so running
-this test against the pre-R2 revision fails in parts 1/2/4.
+Failing-before / passing-after asymmetries:
+  * for the v0 stamp history: the pre-R2 tool had no --format flag at all
+    (`--format` → argparse error, exit 2), and its v0 output stamped
+    format_version = 1, which THIS test asserts is 0 — the pre-R2 revision fails
+    in parts 1/2/4;
+  * for the DEFAULT flip (part 1b): the tool as of R2 (default v0) builds
+    format_version == 0 WITH the group key when no --format is given, so part 1b
+    fails on it — the default is asserted, not assumed.
 """
 
 from __future__ import annotations
@@ -230,10 +244,26 @@ def main() -> int:
         run_tool("--verify", "--src", str(flat), "--out", str(v1), "--format", "v1")
         print("  [ok  ] --verify --format v1 exits 0 (gates 1/5 + R1)")
 
+        # ---- part 1b: the DEFAULT format is v1 (layout.md §8.3/§8.4) ------
+        # The only case that deliberately passes NO --format: the default is
+        # the thing under test. Pre-flip (R2, default v0) this part FAILS.
+        print("part 1b: default format (no --format) is v1")
+        dflt = tmp / "default.gguf"
+        cp = run_tool("--src", str(flat), "--out", str(dflt), "--groups", "3")
+        check("default build exits 0", cp.returncode == 0, cp.stdout + cp.stderr)
+        check("default stdout says 'format      : v1'", "format      : v1" in cp.stdout,
+              cp.stdout[:400])
+        f = read_fields(dflt)
+        check("default build stamps format_version == 1 (u32)",
+              f.get(FORMAT_KEY) == ("UINT32", 1), str(f.get(FORMAT_KEY)))
+        check("default build emits NO group key", GROUP_KEY not in f)
+        run_tool("--verify", "--src", str(flat), "--out", str(dflt))
+        print("  [ok  ] --verify with no --format accepts the default build")
+
         # ---- part 2: the v0 build on the same fixture --------------------
-        print("part 2: v0 build (default) — today's semantics, unchanged")
+        print("part 2: v0 build (--format v0, explicit) — today's semantics, unchanged")
         v0 = tmp / "v0-g3.gguf"
-        cp = run_tool("--src", str(flat), "--out", str(v0), "--groups", "3")
+        cp = run_tool("--src", str(flat), "--out", str(v0), "--format", "v0", "--groups", "3")
         check("v0 build exits 0", cp.returncode == 0, cp.stdout + cp.stderr)
         f = read_fields(v0)
         entries = f.get(GROUP_KEY, ("ABSENT", None))[1]
@@ -244,6 +274,10 @@ def main() -> int:
               f.get(FORMAT_KEY) == ("UINT32", 0), str(f.get(FORMAT_KEY)))
         run_tool("--verify", "--src", str(flat), "--out", str(v0), "--format", "v0")
         print("  [ok  ] --verify --format v0 exits 0")
+        cp = run_tool("--verify", "--src", str(flat), "--out", str(v0), expect=1)
+        check("--verify with no --format REJECTS a v0 build — the default moved, so an "
+              "absent flag is no longer 'v0'", "expected 1 (v1)" in cp.stdout,
+              cp.stdout[:300])
 
         # ---- part 3: every malformed fixture is refused as a SOURCE ------
         print("part 3: malformed fixtures refused as group_experts sources")
@@ -286,9 +320,10 @@ def main() -> int:
                       "--format", "v1", expect=1)
         check("v0 output verified as v1 FAILS", "expected 1 (v1)" in cp.stdout,
               cp.stdout[:300])
-        cp = run_tool("--verify", "--src", str(flat), "--out", str(v1), expect=1)
+        cp = run_tool("--verify", "--src", str(flat), "--out", str(v1),
+                      "--format", "v0", expect=1)
         # the v0 dispatch fails EARLY on the absent key — that IS the mechanism
-        check("v1 output verified as v0 (default) FAILS on the absent key",
+        check("v1 output verified as v0 (explicit) FAILS on the absent key",
               f"{GROUP_KEY} absent from" in cp.stdout, cp.stdout[:300])
 
         # ---- part 4b: the payload-permutation negative (the §8 seam) ------

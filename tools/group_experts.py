@@ -35,12 +35,14 @@ Usage
 G=3); `--spec` names the member sizes explicitly (must sum to ne[2]).
 `--provenance K=V` (repeatable) adds the build fact taillis.provenance.K=V.
 
-`--format` (layout.md §8): v0 (DEFAULT — today's semantics) declares the grouping
-through the taillis.expert_groups string array and stamps format_version = 0;
-v1 (OPT-IN, aubier cannot read it yet — layout.md §8.4) DELETES the array and
-stamps format_version = 1: membership and order are derived from the member
-tensor names (<logical>.g<k>.weight, sorted by ascending k).  A v1 file carrying
-the group key is malformed, and so is a v0 file carrying version 1.
+`--format` (layout.md §8): v1 (DEFAULT — aubier's reader landed and its handshake
+was measured 2026-10-18, layout.md §8.4) DELETES the taillis.expert_groups array
+and stamps format_version = 1: membership and order are derived from the member
+tensor names (<logical>.g<k>.weight, sorted by ascending k).  v0 (SELECTABLE, and
+the form every artifact built before 2026-10-18 carries) declares the grouping
+through the taillis.expert_groups string array and stamps format_version = 0.
+A v1 file carrying the group key is malformed, and so is a v0 file carrying
+version 1.
 NOTE the stamp history: the pre-R2 writer stamped version 1 into v0 files under
 the provisional §7.1 meaning; no artifact was ever built that way (MEASURED
 2026-10-15) and v0 now stamps 0 — layout.md §8.1.
@@ -624,7 +626,7 @@ def show(path: Path) -> int:
     has_key = GROUP_KEY in r.fields
     if version == 1 and not has_key:
         print(f"format      : v1 (derived from member names, layout.md §8.2) — "
-              f"READER NOT SHIPPED YET (docs/R2-reader-request.md)")
+              f"reader LANDED (aubier engine/gguf_model.h; handshake MEASURED, §8.4)")
     elif version == 1:
         print(f"format      : MALFORMED under layout.md §8.1 (version=1 AND {GROUP_KEY} present)")
     elif has_key:
@@ -644,10 +646,10 @@ def main() -> None:
                    help="even-ish split of ne[2] into G contiguous members (default 1 = trivial)")
     p.add_argument("--spec", type=str, default=None,
                    help="explicit member sizes along ne[2], comma-separated, must sum to ne[2]")
-    p.add_argument("--format", choices=("v0", "v1"), default="v0",
-                   help="v0 (default): taillis.expert_groups IS the declaration, version=0; "
-                        "v1 (OPT-IN, layout.md §8): grouping derived from member names, "
-                        "version=1, no group key — aubier cannot read v1 yet")
+    p.add_argument("--format", choices=("v0", "v1"), default="v1",
+                   help="v1 (default, layout.md §8): grouping derived from member names, "
+                        "version=1, no group key; "
+                        "v0: taillis.expert_groups IS the declaration, version=0")
     p.add_argument("--provenance", action="append", default=[], metavar="K=V",
                    help="stamp taillis.provenance.K=V (repeatable; layout.md §7)")
     p.add_argument("--verify", action="store_true",
