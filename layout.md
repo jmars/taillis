@@ -498,7 +498,16 @@ group**, and cannot be a band. Any "variant = group replacement" design is avail
 variant's experts are chosen *contiguously*, up front. V4 makes that option expressible; it does not
 assert it is the right one.
 
-### V4.2 `taillis.variant_band` — a structural key
+### V4.2 `taillis.variant_band` — SUPERSEDED, DO NOT IMPLEMENT
+
+**Status: DEAD. `taillis.variant_band` stays unimplemented (settled 2026-10-18).** V4.7's deciding
+measurement was run and returned **NO STABLE BAND** in both regimes and both populations
+(`results/cold-band.md`, gate re-run independently, exit 0): 29–34 distinct coldest windows across
+35–36 layers out of 121–126 candidates, the best global width-4 band carrying 0.78–0.89× uniform, and
+the per-layer coldest window exactly as cold as relabelling the same count vectors (observed/null
+0.973–1.022, Bonferroni 0). A file-wide contiguous band is therefore not a place that is cold, and the
+variant design is the **manifest row-range** of V4.3 below. The rest of this subsection is kept as the
+record of what was considered, not as a specification.
 
 ```
 taillis.variant_band : u32[2]   # [lo, hi), the reserved adapt/swap home in the EXPERT axis
@@ -537,13 +546,51 @@ blk.<l>.<logical>.ov<K>.weight          ne = (…, …, n_ov)      one band of e
    scheme must preserve it.
 2. **An OVERLAY MUST NOT contain `.g<digits>` members** and **a BASE MUST NOT contain `.ov<k>`
    tensors.** Symmetric refusal, both named failures.
-3. **`ne[2] == n_ov == len(experts)`**, and every expert id lies inside **one** base group's range and
-   inside the band, if a band is declared.
+3. **Two kinds of override tensor, and the kind is DERIVED from the base tensor's rank** — never from a
+   second declaration:
+   - **EXPERT-SLICE**: the base tensor has an expert axis (`ne[2]`), e.g. `ffn_gate_up_exps`. Then
+     `ne[2] == n_ov == len(experts)`, every id lies inside **one** base group's range, and the tensor
+     carries a matching `taillis.overlay_experts.<ovk>` key. (The band of V4.2 is dead; there is no band
+     to also lie inside.)
+   - **WHOLE-TENSOR**: the base tensor has **no** expert axis (rank ≤ 2) and the override replaces the
+     whole tensor — `blk.<l>.ffn_gate_inp.ov<k>.weight`, the router, `ne = (4096,128)` per layer. It needs
+     **no** id key, and its shape/type must equal the base tensor's exactly. This case was missing from
+     the first draft and it blocks S4, which `aubier/docs/expert-swap.md` §4 calls *"the one to build
+     first"*: the router-only variant is 72 MiB, exercises the entire overlay path, and touches no expert
+     tensor. A format that cannot express the cheapest end-to-end test of itself is not finished.
 4. **The overlay's `taillis.parent_sha256` IS the base file's sha256** (§7.1's "declared
    comparator", §7.2 rule 4). No new key is invented for this: `tools/check_chain.py` G3 already
    verifies `sha256(--parent) == parent_sha256`, so **G3 applies to overlays unchanged** — this is the
    whole reason overlays reuse the namespace rather than starting a parallel one.
-5. **A type mismatch against the target group is a named failure at load**, not at first use.
+5. **A type mismatch against the target group is a named failure at load**, not at first use. For a
+   WHOLE-TENSOR override the check is against the base tensor's own type, and the shape must match too.
+   **An overlay carries NO model KV** — no `general.architecture`, no `<arch>.block_count`, no expert
+   count. It is not a model; a loader takes all of that from the BASE and must not read it from the
+   overlay (and an overlay that carries it is malformed, because it is a second copy of a fact the base
+   owns).
+6. **THE MANIFEST IS IN THE FILE, and it is derived wherever derivation is possible.** This is the one
+   place V4 departs from `aubier/docs/expert-swap.md` §4's draft, which put the override list in a side
+   `manifest.json` — and it departs deliberately, for the reason R1 exists at all (FINDINGS §K/K3: a
+   5.6% quality delta stayed unattributable because the files did not carry what built them). A side
+   file is lab notes wearing a filename. So:
+
+   | what | how |
+   |---|---|
+   | layer, logical, `k` | **DERIVED** from the tensor name `blk.<l>.<logical>.ov<k>.weight` — no declaration (§8.2's principle). |
+   | the base it overrides | **DECLARED**, already: `taillis.parent_sha256` = the base file's sha (clause 4). |
+   | expert ids per override tensor | **DECLARED**: ONE SCALAR STRING KEY PER OVERRIDE TENSOR, keyed by the `k` token ALREADY IN THE TENSOR NAME — `taillis.overlay_experts.ov3 = "17,42,97"`. `k` is **globally unique within an overlay file** (the exporter assigns it), so the key addresses exactly one tensor. A `.ov<k>` tensor with no matching key is a named failure, and so is a key with no tensor. |
+   | the target group | **DERIVED**: the group of the base whose range contains the expert ids. All ids of one entry must fall in exactly ONE base group; a straddling entry is malformed. |
+   | the type | **DERIVED** from that base group, and CHECKED equal to the tensor's type (clause 5). |
+   | whether it is an identity overlay | **DECLARED**: `taillis.overlay_identity` (V4.4). |
+
+   Alignment is by the `k` TOKEN, never by position. An earlier draft of this section aligned a single
+   `taillis.overlay_experts` ARRAY to the tensor table by order; that was withdrawn (aubier raised it, and
+   they are right) because a length check cannot catch a mispair: two entries with the same count swap
+   cleanly, and if both fall inside the SAME base group the group and type checks pass too — so the loader
+   would install expert 17's bytes at expert 42's slot, silently. Binding by `k` removes the alignment
+   entirely, because `k` is in the tensor name. A side `manifest.json` remains legal as an **export-side
+   convenience** (a human reading a shelf), never as the authority: a loader that needs it to place an
+   override is refusing to work, and must say so rather than guess.
 
 ### V4.4 §7.1 provenance names added by V4
 
@@ -551,10 +598,29 @@ Extending the defined-name table (all `string`, all optional, `tools/stamp_gguf.
 
 | key | value |
 |---|---|
-| `overlay_target` | the logical tensor name, e.g. `ffn_gate_up_exps` |
-| `overlay_group` | the base member this replaces, e.g. `g3` |
-| `overlay_experts` | comma-separated expert ids, ascending, e.g. `17,42,97` |
-| `overlay_identity` | `true` for a deliberate IDENTITY overlay (bytes equal to the base slab) — the engine's paired gate uses one to prove the read path is transparent; `false` or absent otherwise |
+| `overlay_experts.<ovk>` | ONE SCALAR STRING PER OVERRIDE TENSOR, keyed by the exact `k` token in that tensor's name (`taillis.overlay_experts.ov3` for `blk.<l>.<logical>.ov3.weight`), value a comma-separated ASCENDING list of distinct ids in `[0,128)`. **`k` must be globally unique within the file** (V4.3 clause 6). REQUIRED on every overlay: a `.ov<k>` tensor with no matching key is a named failure, and so is a key with no tensor. |
+| `overlay_identity` | `true` for a deliberate IDENTITY overlay (every override tensor's bytes equal its base slab) — the engine's paired gate uses one to prove the read path is transparent; `false` or absent otherwise. A FILE-LEVEL flag: it describes the whole overlay, not one tensor. |
+
+| `overlay_tool` | the exporter that wrote the overlay, `tools/repack_overlay.py@<taillis git commit>[+dirty]` — same convention as `grouping_tool` (§7.1). Optional but stamped, for the K3 reason. |
+
+**TWO KEYS ARE MANDATORY ON A NON-IDENTITY OVERLAY, and both are §7.1 names that already exist:** the
+imatrix sha256 the override bytes were quantised with, and the type/quant spec used. Without them a
+variant's measured quality is confounded with a requantisation, and any comparison will blame the variant
+for the quantiser — the exact attribution failure R1 was built to stop (§5.3 of aubier's plan makes the
+rule checkable; these keys are what make it checkable *from the file*).
+
+**On an IDENTITY overlay they MUST BE ABSENT.** An identity override is a verbatim byte copy of the base's
+own slab: nothing was quantised, so there is no imatrix and no quant flags, and requiring them would force
+the writer to declare a fact that is not true. That is the same failure as a missing declaration, pointed
+the other way — and this spec has already spent a session removing declarations that are not facts
+(V4.4's forbidden keys, §8.1's flat case). A writer that stamps a quantisation provenance onto an identity
+overlay is writing a lie, and the checker FAILS it.
+
+**`overlay_target` and `overlay_group` are NOT keys and must not be written.** An earlier draft of this
+table declared them; both are derivable — the target logical is in the tensor name and the group follows
+from the expert ids against the base's segments (V4.3 clause 6). Declaring them would be the same
+redundancy disease §8/R2 removed: a second declaration of a fact the artifact already carries, and a
+second thing that can disagree with it.
 
 ### V4.5 Checker gates — `tools/check_chain.py`
 
@@ -562,10 +628,18 @@ Extending the defined-name table (all `string`, all optional, `tools/stamp_gguf.
 member of the parent's type to carry the *parent's slab bytes*, which is precisely what an overlay
 exists to change. The overlay's complement property is G8.3 instead.
 
-- **G8** OVERLAY validity (V4.3): parses; no `.g<digits>` member; every `.ov<k>` tensor's
-  `ne[2] == len(overlay_experts)`; every expert id inside ONE base group's range (and inside
-  `variant_band` when declared); the tensor's type EQUALS that group's type; `overlay_target` /
-  `overlay_group` / `overlay_experts` present and mutually consistent; G3 passes against the base.
+- **G8** OVERLAY validity (V4.3): parses; no `.g<digits>` member; **the kind of each override is derived
+  from the BASE tensor's rank** (V4.3 clause 3) — for an EXPERT-SLICE tensor, a matching
+  `taillis.overlay_experts.<ovk>` key must exist and **every such key must have a matching tensor** (both
+  directions, a named failure each — there is no positional alignment to get wrong, so a missing or
+  orphaned key is the only pairing error possible); for a WHOLE-TENSOR override no key is expected and a
+  stray key is FAIL; `k` is unique across the file; every entry parses as an ascending list of distinct ids
+  in `[0,128)`; every expert-slice tensor's `ne[2] == len(entry)` and **every id of one entry falls in
+  exactly ONE base group's range** (a straddling entry is FAIL); a whole-tensor override's shape and type
+  EQUAL the base tensor's; every expert-slice tensor's type EQUALS its derived group's type;
+  `overlay_target` / `overlay_group` are ABSENT (they are derived facts and their presence is FAIL — V4.4);
+  the mandatory quantisation provenance (imatrix sha, type spec) is present; **the overlay carries no model
+  KV** (V4.3 clause 5); G3 passes against the base.
 - **G8.3** overlay↔base direction: bytes EQUAL to the base slab ⇒ REQUIRES
   `overlay_identity=true` (otherwise FAIL: a pointless overlay is a build error, and an identity
   overlay is legal *only* when it says so). Bytes DIFFER ⇒ `overlay_identity` must be absent/false.
