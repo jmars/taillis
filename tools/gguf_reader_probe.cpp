@@ -16,6 +16,16 @@
 // exit 1, so the expectation can actually fail.  Expert tensors are additionally
 // CHECKed to cover [0, N_EXPERT) contiguously.
 //
+// V4 (taillis/layout.md) — NOT IMPLEMENTED, do not brief it as existing.  An
+// OVERLAY file (the `.ov<k>` class of aubier variant sets) must be REFUSED here
+// with a named failure ("overlay file, not a base") BEFORE GGUFModel::load() is
+// called: load() CHECKs the fixed 579-tensor surface, and an overlay carries only
+// override tensors, so it fails with a missing-tensor message that names nothing
+// useful.  If it ever got past load(), the coverage CHECK would fail too, because
+// `<logical>.ov<k>` contains the substring ffn_gate_up_exps and is_expert_logical()
+// would match it, expecting segments to cover [0,N_EXPERT).  An overlay is read by
+// the overlay loader, never here.  Obligations: layout.md V4.6.
+//
 // Build (see aubier/scripts/engine_build.sh; the libs carry a stale RUNPATH into
 // the dead /var/data/workspace tree, so LD_LIBRARY_PATH is mandatory at runtime):
 //   c++ -O2 -std=c++17 -I <aubier>/src/llama.cpp/ggml/include -I <aubier>/engine \

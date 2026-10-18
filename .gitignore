@@ -17,3 +17,7 @@ results/*.jsonl
 /todo.md
 /plan.md
 /docs/
+
+# A handoff document from another lane (aubier): kept in the working copy, not published
+# from this repo -- it carries that lane's internal numbers. See handoff.md on disk.
+/handoff.md

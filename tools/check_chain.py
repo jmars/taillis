@@ -62,6 +62,14 @@ writer's check_write_scope allowlist (/var/lib/taillis/models, /tmp).
 No engine change is involved or checked: the reader knows one taillis.* key
 (aubier gguf_model.h:183) and ignores the rest (§7.2 rule 2).  Needs gguf-py
 (venvs/convert/bin/python3); re-execs under that venv when not importable.
+
+V4 (layout.md, "the variant band and the OVERLAY file class") — NOT IMPLEMENTED,
+do not brief it as existing.  Overlay files (the `.ov<k>` class, aubier's
+variant sets) would add G8 / G8.3 / G9 and SKIP G5 with a named reason (G5
+requires a parent-type member to carry the parent's bytes; changing those bytes
+is what an overlay IS).  G3 already covers an overlay's base unchanged — an
+overlay stamps taillis.parent_sha256 with the base file's sha.  Gates:
+layout.md V4.5; obligations: V4.6.
 """
 
 from __future__ import annotations

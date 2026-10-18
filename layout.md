@@ -211,12 +211,21 @@ at build time on *future* artifacts only (`convert_f16.sh` STEP 3, `group_expert
 the quantize wrapper when it exists). Any re-derivation of an existing arm under this spec is a NEW
 artifact with its own name and its own `parent_sha256` chain.
 
+**Added 2026-10-18, on the same rule (§8.4):** the two full-size R2 v1 fixtures
+`MS4-119B-UD-IQ2_XXS-g1-v1.gguf` and `MS4-119B-UD-IQ2_XXS-g3-v1.gguf` are on this list from the
+moment they were measured — as are `2L-v1-g3.gguf` and the v0 originals `-g1`, `-g3`, `2L-g3`,
+which stay BECAUSE they are the continuity reference: the v0 pair carries the key-declared
+grouping the v1 pair must be identical to, so rewriting either side destroys the comparison.
+Regrouping under a different default is a new artifact (as this unit's `-v1` names are), never a
+rewrite of a measured one.
+
 ## 8. R2 — v1: the grouping is derived from the member tensor names (spec)
 
-**Status: the writer half is implemented (`tools/group_experts.py --format v1`, OPT-IN —
-the default is still v0); the reader half is REQUESTED from `aubier`
-(`docs/R2-reader-request.md`) and does not exist yet.** The binding migration order is
-§8.4.
+**Status: COMPLETE, 2026-10-18.** The writer emits v1 **by default**
+(`tools/group_experts.py --format`, v0 selectable) and the reader half LANDED in
+`aubier` (`engine/gguf_model.h` `read_expert_groups()`, version dispatch); the handshake
+§8.4 made binding is MEASURED on this host, including on both full-size grouped
+artifacts — §8.4.
 
 ### 8.1 Version dispatch
 
@@ -263,9 +272,13 @@ invariants and stay (§8.2.3).
 
 ### 8.3 Writer behaviour
 
-`tools/group_experts.py --format {v0,v1}` (default **v0**). v1 stamps
-`taillis.format_version = 1` plus the R1 keys (§7.1) and emits **no** group key; v0 is
-today's semantics with the stamp set to `0` (§8.1). The already-grouped-source refusal
+`tools/group_experts.py --format {v0,v1}` (default **v1** since the §8.4 handshake was
+measured, 2026-10-18; `--format v0` stays selectable and is the form every artifact built
+before that date carries). v1 stamps `taillis.format_version = 1` plus the R1 keys
+(§7.1) and emits **no** group key; v0 is today's semantics with the stamp set to `0`
+(§8.1). The default covers `--verify` too, so the format a build stamps is the format a
+verify expects; §8.4's evidence passes `--format` explicitly at every call so no gate
+changes meaning when a default moves. The already-grouped-source refusal
 scans the source's tensor table for member-shaped names (`<anything>.g<k>.weight`)
 **and** refuses a source carrying `taillis.expert_groups` (a key-carrying source is
 grouped, member-shaped names or not — otherwise a v1 output could inherit the stale key
@@ -276,11 +289,56 @@ surface (such a file is not a flat parent).
 ### 8.4 Migration order (binding)
 
 **The reader must support v1 before any writer emits v1 by default.** The only reader
-is aubier's engine, and today an absent key is read as "flat file" and then fails
-`logical()` on the missing flat tensor (`gguf_model.h:237-238` → `:326`) — to today's
-reader a v1 file is indistinguishable from a corrupt flat one. Until the request lands,
-v1 is OPT-IN only; the writer default flips only in the same change that lands aubier's
-reader and re-runs the F1 gate (`docs/R2-reader-request.md` §5).
+is aubier's engine, and until R2 an absent key was read as "flat file" and then failed
+`logical()` on the missing flat tensor (`gguf_model.h:237-238` → `:326`) — to the pre-R2
+reader a v1 file was indistinguishable from a corrupt flat one. Hence R2 shipped the
+writer as an OPT-IN and the default stayed v0.
+
+**SATISFIED 2026-10-18 — R2 IS COMPLETE.** Both halves landed and the handshake is
+MEASURED on this host, CPU only (no GPU, no `-ngl`; `~/futaie/aubier` read-only — the
+probe is compiled FROM `tools/gguf_reader_probe.cpp` INTO `/tmp` against
+`aubier/builds/cpu` and run with `LD_LIBRARY_PATH=$HOME/futaie/aubier/builds/cpu/bin`):
+
+- **READER (aubier, CODE):** `read_expert_groups()` at `engine/gguf_model.h:270-341` —
+  version dispatch (absent/0 = the v0 loop verbatim; 1 = the key MUST be absent plus the
+  derivation over the reader's own 72-logical checklist, ascending `k` = expert order;
+  an unknown version is refused). Report: `~/futaie/aubier/results/loader-r2.md`.
+- **HANDSHAKE (MEASURED):** the key-less v1 artifact derives exactly the segments the v0
+  key declares. `2L-v1-g3.gguf` (v1, no key) and `2L-g3.gguf` (v0, key declares the
+  grouping) print **IDENTICAL** probe stdout — `diff` EMPTY, exit 0 both:
+  `blk.0.ffn_gate_up_exps.weight ne=[4096,4096,128,1] segs=3 [0,43)f16 [43,86)f16
+  [86,128)f16` (nbytes 1442840576/1442840576/1409286144). The ranges came from the names
+  alone.
+- **DEFAULT FLIPPED:** `tools/group_experts.py --format` defaults to **v1** (build AND
+  verify — the format a build stamps is the format a verify expects); `--format v0` stays
+  selectable. Every gate below passes `--format` EXPLICITLY, so no check changed meaning
+  when the default moved; `eval/test_group_experts_v1.py` asserts the default itself
+  (part 1b) and was proven to FAIL when the default is mutated back to v0.
+- **FULL-SIZE artifacts (MEASURED; NEW names, §7.3 — the v0 pair is untouched):**
+  `MS4-119B-UD-IQ2_XXS-g1-v1.gguf` (34,924,187,808 B) and `…-g3-v1.gguf`
+  (34,924,199,200 B), built by the flipped default from the shipped flat IQ2_XXS quant
+  (`parent_sha256 = 82a67684…c478beb3`). `--verify --format v1`: **exit 0 both** —
+  gate 1 72/72 (G=1) and 216/216 (G=3) member payloads byte-identical to the parent slab
+  plus 507/507 verbatim tensors, gate 5 72/72 logicals with sum(member nbytes) == parent
+  nbytes, R1 keys present, group key ABSENT.
+- **F1 INERTNESS at FULL SIZE (MEASURED):** probe stdout on the flat quant and on the
+  **G=1 v1** file is byte-identical — `diff` EMPTY, md5 `957a895288d0f26cd2b2ab44ab115384`
+  for both. G=1 is invisible through the reader, not merely similar.
+- **G=3 (MEASURED):** the v1 G=3 file reads back `segs=3 [0,43)/[43,86)/[86,128)` with the
+  same types (`iq2_xxs` for `ffn_gate_up_exps`, `iq2_s` for the last member of
+  `ffn_down_exps`) and the same nbytes as the v0 G=3 file — full stdout `diff` EMPTY; and
+  all 72 logicals equal an **independent** derivation of §8.1/§8.2 — re-derived from the
+  file's own declaration with gguf-py (cumulative `ne[2]` in declared/ascending-`k` order,
+  gguf-py types and nbytes), NOT with aubier's reader — diff empty.
+- **v0 CONTINUITY (MEASURED — this section's own control):** `-g1`, `-g3` and `2L-g3`
+  still load (exit 0; 72/72/4 grouped logicals) and their segment lists still equal what
+  the v0 key declares (independent derivation, diff empty); the v0 G=1 file is still
+  byte-inert against the flat quant (stdout diff EMPTY). Nothing about v0 changed.
+
+What remains binding: the ORDER still runs one way. A future format version may not
+flip a default before the reader for it has landed and this same handshake has been
+MEASURED on a full-size artifact — and no already-measured artifact is rewritten to get
+there (§7.3).
 
 ## 9. R3 — the comparison chain as a format obligation (spec)
 
@@ -398,3 +456,141 @@ identity.
   sizes, same global type multiset, |whole-file size difference| <= 384 B, assignment differs,
   arm/seed/type-file keys present.
 - **G7** exit code = gate; output prints COUNTS, SIZES, PATHS and each failure with its mechanism.
+
+## V4 — the variant band and the OVERLAY file class (spec)
+
+**Provenance: written by aubier 2026-10-18 (a different aubier session from the engine-swap
+work), and renamed `V4` by agreement on the taillis<->aubier bus the same day to free `R4` for the
+format proposal's fixed-bytes hotness allocation (`docs/format-proposal.md` R4). The measurement
+V4.7 asks for has since been RUN and returned **NO STABLE BAND** (`results/cold-band.md`);
+V4.7's own consequence therefore applies.**
+
+**Status: PROPOSAL, 2026-10-18. Nothing here is implemented.** Motivating record:
+`../aubier/docs/expert-swap.md` (S1–S7), the engine-side plan for serving a *variant* — a set of
+overridden `(layer, expert)` weights whose bytes come from a second file. This section amends the
+FORMAT only; it decides no policy, and it creates no obligation on any artifact already on disk
+(§7.3 stands unchanged).
+
+**V4 is additive and inherits §7.2 rules 1–2 verbatim**: every new key is optional, absent keys mean
+the file is exactly today's file, and unknown `taillis.*` keys are ignored by the reader. **V4 adds
+no value to `taillis.format_version`** and does not touch §8.1 dispatch — a file may be v0 or v1 and
+still carry a band.
+
+### V4.1 Why: the one thing the format cannot currently express
+
+A variant needs its target experts to be addressable as a *unit* by the engine, and it needs the
+engine to know, without a side file, which experts are the adapt/swap home. Today that is
+inexpressible: `taillis.expert_groups` says how the expert axis is *split for quantisation*, which
+is a different question from *which experts a variant will replace*.
+
+There is also a hard structural constraint that decides the design: **groups are contiguous ranges
+that tile `[0,128)`** (§2 rule 1). A measured cold set like `{17, 42, 97}` therefore **cannot be a
+group**, and cannot be a band. Any "variant = group replacement" design is available only if the
+variant's experts are chosen *contiguously*, up front. V4 makes that option expressible; it does not
+assert it is the right one.
+
+### V4.2 `taillis.variant_band` — a structural key
+
+```
+taillis.variant_band : u32[2]   # [lo, hi), the reserved adapt/swap home in the EXPERT axis
+```
+
+Normative properties:
+
+1. **Absent ⇒ no band** and behaviour is exactly today's. Present ⇒ `0 <= lo < hi <= 128`.
+2. **Named as an expert RANGE, never as a group.** Grouping is a quantisation decision that changes
+   between recipes; which experts are the adapt home is a model decision. Naming `g3` would make the
+   band disappear when a later recipe re-groups.
+3. **BAND EDGES MUST FALL ON GROUP BOUNDARIES** in every grouped expert logical tensor. This is the
+   invariant that makes a variant a *whole-group replacement* (GGUF-native, no row arithmetic, and a
+   member type may then differ from its neighbours without inventing per-expert tensors — §2 rule 3
+   still holds, because the band is a group like any other). A grouped file whose boundaries cut the
+   band MUST be refused at load with a named failure, not silently served.
+4. **The band's member type is the variant's type** (engine-side same-type rule, `expert-swap.md`
+   §5.3). Consequence, stated so nobody is surprised: **the band's type is a quality CEILING for
+   every variant placed in it.** A cold band wants few bits; an adapted expert wants more. Those pull
+   opposite ways and the choice belongs to the recipe, not the format.
+
+### V4.3 The OVERLAY file class — `.ov<k>` tensors
+
+An OVERLAY is a GGUF that is **not a model**: it carries only override tensors plus KV, and it is
+read by an overlay loader, never by `GGUFModel::load()`.
+
+```
+blk.<l>.ffn_gate_up_exps.ov<K>.weight   ne = (4096, 4096, n_ov)
+blk.<l>.<logical>.ov<K>.weight          ne = (…, …, n_ov)      one band of experts
+```
+
+1. **`.ov<k>` MUST NOT match `<logical>.g<digits>`.** It is chosen so §8.2's name-derived v1
+   grouping cannot mistake an override for a grouping declaration. `group_member_logical()`
+   (`aubier/engine/gguf_model.h`) already requires `.g` followed by digits only — V4 fixes the
+   overlay naming so that requirement keeps holding *by construction*, and any future overlay naming
+   scheme must preserve it.
+2. **An OVERLAY MUST NOT contain `.g<digits>` members** and **a BASE MUST NOT contain `.ov<k>`
+   tensors.** Symmetric refusal, both named failures.
+3. **`ne[2] == n_ov == len(experts)`**, and every expert id lies inside **one** base group's range and
+   inside the band, if a band is declared.
+4. **The overlay's `taillis.parent_sha256` IS the base file's sha256** (§7.1's "declared
+   comparator", §7.2 rule 4). No new key is invented for this: `tools/check_chain.py` G3 already
+   verifies `sha256(--parent) == parent_sha256`, so **G3 applies to overlays unchanged** — this is the
+   whole reason overlays reuse the namespace rather than starting a parallel one.
+5. **A type mismatch against the target group is a named failure at load**, not at first use.
+
+### V4.4 §7.1 provenance names added by V4
+
+Extending the defined-name table (all `string`, all optional, `tools/stamp_gguf.py` writes them):
+
+| key | value |
+|---|---|
+| `overlay_target` | the logical tensor name, e.g. `ffn_gate_up_exps` |
+| `overlay_group` | the base member this replaces, e.g. `g3` |
+| `overlay_experts` | comma-separated expert ids, ascending, e.g. `17,42,97` |
+| `overlay_identity` | `true` for a deliberate IDENTITY overlay (bytes equal to the base slab) — the engine's paired gate uses one to prove the read path is transparent; `false` or absent otherwise |
+
+### V4.5 Checker gates — `tools/check_chain.py`
+
+**G5 does NOT apply to an overlay and must be SKIPPED for one, with a named reason**: G5 requires a
+member of the parent's type to carry the *parent's slab bytes*, which is precisely what an overlay
+exists to change. The overlay's complement property is G8.3 instead.
+
+- **G8** OVERLAY validity (V4.3): parses; no `.g<digits>` member; every `.ov<k>` tensor's
+  `ne[2] == len(overlay_experts)`; every expert id inside ONE base group's range (and inside
+  `variant_band` when declared); the tensor's type EQUALS that group's type; `overlay_target` /
+  `overlay_group` / `overlay_experts` present and mutually consistent; G3 passes against the base.
+- **G8.3** overlay↔base direction: bytes EQUAL to the base slab ⇒ REQUIRES
+  `overlay_identity=true` (otherwise FAIL: a pointless overlay is a build error, and an identity
+  overlay is legal *only* when it says so). Bytes DIFFER ⇒ `overlay_identity` must be absent/false.
+- **G9** symmetry refusals: a BASE containing `.ov<k>` ⇒ FAIL "overlay tensors in a base"; an OVERLAY
+  containing `.g<digits>` ⇒ FAIL "grouping declaration in an overlay"; a grouped base whose group
+  boundary cuts `variant_band` ⇒ FAIL naming the boundary and the band.
+
+### V4.6 Tool obligations (not yet implemented — do not brief any of this as existing)
+
+- `tools/check_chain.py` — G8, G8.3, G9 above; G5 skipped for overlays.
+- `tools/gguf_reader_probe.cpp` — the probe must refuse an overlay as a BASE with a named failure
+  ("overlay file, not a base") **before `GGUFModel::load()` is called**. Two reasons, both MEASURED
+  from the tool: `load()` CHECKs the fixed 579-tensor surface, so an overlay's few tensors fail as a
+  missing-tensor message that names nothing useful; and if it ever got past `load()`, the coverage
+  CHECK would fail too, because **`<logical>.ov<k>` CONTAINS the substring `ffn_gate_up_exps`, so
+  `is_expert_logical()` matches it** and then requires segments covering `[0, 128)`. This is a
+  requirement of the probe, not of the reader.
+- `tools/group_experts.py` — refuses an already-grouped source (§8.3); must also refuse an OVERLAY
+  source, and must never emit `.ov<k>`.
+- `tools/stamp_gguf.py` — writes the V4.4 names; `overlay_identity` is REQUIRED on an identity
+  overlay and forbidden otherwise.
+
+### V4.7 What V4 does NOT decide, and the measurement that should decide it
+
+**Whether a band should exist at all.** V4.2 makes the *contiguous-band* design expressible; it does
+not endorse it. The competing design (`../aubier/docs/expert-swap.md` §4) puts the override list in the
+manifest and needs no band, and it is the only one that supports a *scattered* expert set.
+
+The deciding measurement is cheap and uses instruments already in this repository: **is there a
+stable contiguous cold band?** `t22a`/`t22b` already measure per-expert routing; ask of several
+sessions whether ~4 experts are consistently cold on a general sample AND on the target corpus
+(aubier's dual criterion). Stable band ⇒ V4.2 is the better path. No stable band ⇒ use the
+manifest row-range design and leave `variant_band` unimplemented (an absent key costs nothing, which
+is the point of putting it in this namespace rather than in the engine).
+
+This mirrors §5's discipline: the prior is small, and a null result is a legitimate and useful
+outcome.
