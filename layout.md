@@ -602,6 +602,7 @@ Extending the defined-name table (all `string`, all optional, `tools/stamp_gguf.
 | `overlay_identity` | `true` for a deliberate IDENTITY overlay (every override tensor's bytes equal its base slab) — the engine's paired gate uses one to prove the read path is transparent; `false` or absent otherwise. A FILE-LEVEL flag: it describes the whole overlay, not one tensor. |
 
 | `overlay_tool` | the exporter that wrote the overlay, `tools/repack_overlay.py@<taillis git commit>[+dirty]` — same convention as `grouping_tool` (§7.1). Optional but stamped, for the K3 reason. |
+| `overlay_digest.<ovk>` | sha256 of that override tensor's PAYLOAD, one per tensor, keyed by `k` like the ids. **REQUIRED on every overlay.** Without it a non-identity overlay is unauditable against its base *by construction*: its payload is supposed to differ from the base's, so nothing in the file can distinguish a correct override from a corrupted one. Stamped at build; `--verify` recomputes. |
 
 **TWO KEYS ARE MANDATORY ON A NON-IDENTITY OVERLAY, and both are §7.1 names that already exist:** the
 imatrix sha256 the override bytes were quantised with, and the type/quant spec used. Without them a
@@ -609,12 +610,18 @@ variant's measured quality is confounded with a requantisation, and any comparis
 for the quantiser — the exact attribution failure R1 was built to stop (§5.3 of aubier's plan makes the
 rule checkable; these keys are what make it checkable *from the file*).
 
-**On an IDENTITY overlay they MUST BE ABSENT.** An identity override is a verbatim byte copy of the base's
-own slab: nothing was quantised, so there is no imatrix and no quant flags, and requiring them would force
-the writer to declare a fact that is not true. That is the same failure as a missing declaration, pointed
-the other way — and this spec has already spent a session removing declarations that are not facts
-(V4.4's forbidden keys, §8.1's flat case). A writer that stamps a quantisation provenance onto an identity
-overlay is writing a lie, and the checker FAILS it.
+**On an IDENTITY overlay they are OPTIONAL — and that is a correction to this spec.** The first draft said
+they are FORBIDDEN there, on the reasoning "identity ⇒ a byte copy ⇒ nothing was quantised". **MEASURED
+falsification:** re-quantising the base's own F16 slice at the base's own type with the base's own imatrix
+returns the base's bytes EXACTLY (24 slabs, 84,944,656 bytes, 0 differing, across `IQ2_XXS`, `IQ2_S` and
+`IQ3_S`), so an overlay can be identity-compatible *in bytes* **and** have been produced by quantisation.
+The two properties are independent, and a rule keyed on one must not forbid the other's provenance.
+Required on non-identity, optional on identity, and the checker accepts both.
+
+**AND "the same imatrix" needs a mechanism, because the literal reading does not work.** `llama-quantize`
+**refuses** a full imatrix for a slice: the matrix is per-`(expert, column)` and its length must equal
+`ne[0] * ne[2]` (`llama-quant.cpp:1284`, used at `:784-786`). So the build rule is: **the SAME imatrix,
+CROPPED to the same experts** — exact and lossless — recorded as `taillis.provenance.expert_crop`.
 
 **`overlay_target` and `overlay_group` are NOT keys and must not be written.** An earlier draft of this
 table declared them; both are derivable — the target logical is in the tensor name and the group follows
@@ -638,8 +645,10 @@ exists to change. The overlay's complement property is G8.3 instead.
   exactly ONE base group's range** (a straddling entry is FAIL); a whole-tensor override's shape and type
   EQUAL the base tensor's; every expert-slice tensor's type EQUALS its derived group's type;
   `overlay_target` / `overlay_group` are ABSENT (they are derived facts and their presence is FAIL — V4.4);
-  the mandatory quantisation provenance (imatrix sha, type spec) is present; **the overlay carries no model
-  KV** (V4.3 clause 5); G3 passes against the base.
+  the quantisation provenance (imatrix sha, type spec) is present on a NON-identity overlay and permitted on
+  an identity one (V4.4); **every override tensor's payload hashes to its `taillis.overlay_digest.<ovk>`**
+  (a mismatch is FAIL naming the tensor — this is the ONLY content check possible on a non-identity
+  overlay); **the overlay carries no model KV** (V4.3 clause 5); G3 passes against the base.
 - **G8.3** overlay↔base direction: bytes EQUAL to the base slab ⇒ REQUIRES
   `overlay_identity=true` (otherwise FAIL: a pointless overlay is a build error, and an identity
   overlay is legal *only* when it says so). Bytes DIFFER ⇒ `overlay_identity` must be absent/false.

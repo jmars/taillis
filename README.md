@@ -37,6 +37,18 @@ writes them back as an overlay, and proves the round trip byte-for-byte — on a
 grouped one, with an uneven tiling so that "the segments come from the base's own declaration"
 cannot be confused with "the segments were assumed to be even".
 
+**S1b, the merge path, answers the question the format cannot:** a variant's bytes are *quantised*
+from the ≥16-bit source, not copied — merge at F16, then re-quantise with the base's own imatrix and
+type spec. It reproduces the base's bytes **exactly** when no delta is merged (24 expert slabs, three
+types, 0 differing bytes), so every later difference is the delta. One mechanism fact decides how
+that can be done at all: **llama-quantize refuses the base's imatrix for a slice** — the matrix is
+per-(expert, column) and its length must be `ne[0]·ne[2]` — so "the same imatrix" has to mean the
+same matrix *cropped to the same experts* (`results/s1b-merge-path.md` §1). And a variant overlay is
+**unauditable against its base by construction** — its bytes are supposed to differ, so that finding
+became the format's `taillis.overlay_digest.<ovk>` (a per-tensor payload sha256, required on every
+overlay): `--verify` recomputes it and rejects a one-byte corruption **by name, with no F16 and no
+quantiser**. `--verify --f16` still goes further and reproduces the payload from the declared spec.
+
 ## What was measured and then dropped
 
 The project began as a byte-reduction campaign: fewer bytes per expert, because in the engine bytes
