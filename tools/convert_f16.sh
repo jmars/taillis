@@ -27,8 +27,23 @@ set -euo pipefail
 TREE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$TREE"
 
-LLAMACPP="$HOME/futaie/aubier/src/llama.cpp"
+# The converter tree MOVES (it lived at aubier/src/llama.cpp when the shipped F16 was built and
+# has since been vendored at aubier/vendor/llama.cpp, under aubier's own git commit). So the path is
+# resolved, and the pin is a CONTENT HASH rather than a commit: a commit cannot be recovered once a
+# tree is vendored into someone else's repository, and the thing this script actually depends on is
+# the bytes of one file. Override the path with LLAMACPP=... if it moves again.
+if [ -z "${LLAMACPP:-}" ]; then
+  for d in "$HOME/futaie/aubier/vendor/llama.cpp" "$HOME/futaie/aubier/src/llama.cpp"; do
+    if [ -f "$d/convert_hf_to_gguf.py" ]; then LLAMACPP="$d"; break; fi
+  done
+fi
 CONVERTER="$LLAMACPP/convert_hf_to_gguf.py"
+# MEASURED: the shipped F16 was converted by the converter as it stood at llama.cpp 50e3e3e4
+# (`~/futaie/aubier/src/llama.cpp`). That tree is gone; this hash is the converter VENDORED TODAY
+# (`~/futaie/aubier/vendor/llama.cpp`, aubier commit 0491c2b). A rebuild from today's tree is
+# therefore NOT proven byte-identical to the shipped artifact — the hash makes that drift VISIBLE
+# rather than silent. Set the hash from a build you intend to reproduce, and record it in the output.
+CONVERTER_SHA256=e9a1da876330bbce9687541ab31736542a01b4ac43c6686126514a50f122fb7f
 PINNED_COMMIT=50e3e3e480c80b9ee0ea067e475602d540dc62c8
 SRC=models/Mistral-Small-4-119B-2603
 OUT=models/Mistral-Small-4-119B-2603-f16.gguf
@@ -39,12 +54,21 @@ LAUNCH=(nice -n 10 taskset -c 0-7 env OMP_NUM_THREADS=8 MKL_NUM_THREADS=8)
 die() { echo "FATAL: $*" >&2; exit 1; }
 
 [ -x "$PY" ] || die "$PY missing; see results/t1-f16.md for the venv recipe"
-[ -f "$CONVERTER" ] || die "$CONVERTER missing"
-have=$(git -C "$LLAMACPP" rev-parse HEAD)
-[ "$have" = "$PINNED_COMMIT" ] || die "converter tree is at $have, not the pinned $PINNED_COMMIT"
+[ -f "$CONVERTER" ] || die "$CONVERTER missing (moved again? set LLAMACPP=...)"
+# The converter is not self-contained: it imports siblings from its own tree. MEASURED 2026-10-19: the
+# tree as vendored at aubier/vendor/llama.cpp is MISSING conversion.py and gguf-py, so it cannot run.
+# A missing sibling is a different failure from a moved tree, and saying so saves the next reader an hour.
+for need in conversion.py gguf-py; do
+  [ -e "$LLAMACPP/$need" ] || die "converter tree is INCOMPLETE: $LLAMACPP/$need is missing.
+       The converter imports it, so this build cannot run. The tree this was vendored from must be
+       restored (reported to aubier); nothing in this repo can substitute for it."
+done
+have=$(sha256sum "$CONVERTER" | cut -d" " -f1)
+[ "$have" = "$CONVERTER_SHA256" ] || die "converter content is $have, not the pinned $CONVERTER_SHA256
+       (if this build is meant to be a NEW baseline, update CONVERTER_SHA256 and say so in results/)"
 
 echo "== converter : $CONVERTER"
-echo "== commit    : $have"
+echo "== converter : sha256 $have"
 echo "== venv      :"
 "$PY" -m pip freeze | sed 's/^/     /'
 
