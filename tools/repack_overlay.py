@@ -53,11 +53,40 @@ Usage
         --requantise --override "L:LOGICAL:ID,ID" \
         --imatrix IMATRIX.gguf --type-file TYPES.txt --llama-quantize BIN \
         [--quant-type IQ2_XXS] [--delta DELTA.gguf | --delta-synth SEED:RELRMS]
+    # the ADAPTER path (unit LORA): the same merge, with the delta DERIVED from a
+    # PEFT adapter instead of handed in precomputed
+    tools/repack_overlay.py --base BASE.gguf --f16 F16.gguf --out OVERLAY.gguf \
+        --requantise --override "L:LOGICAL:ID,ID" \
+        --imatrix IMATRIX.gguf --type-file TYPES.txt --llama-quantize BIN \
+        --lora ADAPTER.safetensors [--lora-config adapter_config.json]
     # and the reproduction gate (the only check that can see a corrupted byte in
     # an overlay whose bytes are supposed to differ from the base)
     tools/repack_overlay.py --verify --base BASE.gguf --overlay OVERLAY.gguf \
         --f16 F16.gguf --imatrix IMATRIX.gguf --type-file TYPES.txt \
-        --llama-quantize BIN [--delta ... | --delta-synth SEED:RELRMS]
+        --llama-quantize BIN [--delta ... | --delta-synth SEED:RELRMS | --lora ...]
+
+THE ADAPTER PATH DOES NOT FORK THE QUANTISE PATH, ON PURPOSE.  `--lora` produces
+exactly the array `--delta` used to supply — a per-expert (n_ov, ne1, ne0) delta —
+and hands it to the SAME cut/merge/re-quantise implementation, so there is still
+exactly ONE place where an override's bytes are made (and `--verify --f16 --lora`
+re-derives the payload from the adapter itself).  The delta is built in F32 and
+merged by one F16 store, because an adapter is a rank-r FACTORISATION: rounding
+B@A down to F16 first would throw away precision that costs nothing to keep.
+
+THE ADAPTER FORMAT, and the one thing it must never do.  Accepted: PEFT
+safetensors, one 2-D `lora_A.weight` (r, in) + `lora_B.weight` (out, r) pair per
+(expert, projection), module paths `layers.<l>.experts.<e>.{w1,w2,w3}` (layout.md
+§6) or their HF aliases `{gate_proj,up_proj,down_proj}`, optionally under
+`base_model.model.` and one model prefix.  W = W + (alpha/rank) B@A per expert,
+w1|w3 placed into the FUSED `ffn_gate_up_exps` out axis (which half is which was
+MEASURED against the checkpoint's own weights, not assumed — see the mapping block
+below).  A pair with NO expert index is REFUSED by name: it is the shape
+llama-export-lora ABORTS on, and applying one delta to 128 experts is the silent
+mis-weighting this project exists to prevent.  rsLoRA/DoRA/per-module alpha-or-rank
+are refused too (each is a different scale), as is an unrecognised module name.
+Recognised DENSE modules (attention, router, shared experts) cannot be expressed by
+an expert-slice override at all; they are counted and DECLARED in the merge_delta
+provenance, never silently dropped.
 
 THE ID KEY IS PER-TENSOR, AND `k` IS GLOBALLY UNIQUE IN THE FILE.  layout.md V4.4
 (withdrew the single ARRAY key of the first draft — aubier's objection, and they
@@ -698,6 +727,401 @@ def merged_f16(rows: np.ndarray, delta: np.ndarray | None) -> tuple[np.ndarray, 
     }
 
 
+# ---------------------------------------------------------------------------
+# THE ADAPTER PATH (unit LORA): a PEFT safetensors adapter -> the F16 delta
+# ---------------------------------------------------------------------------
+# MEASURED (handoff-taillis-xcheck-result, against llama.cpp's own llama-export-lora
+# on six cases): W' = W + (alpha/rank) * B @ A, with rank = lora_b's rank axis, and
+# an ABSENT alpha meaning scale 1.0 (the user scale alone, llama-graph.cpp:1625).
+# A is stored TRANSPOSED in GGUF (lora_a ne=(in, r) = numpy (r, in)) — which is
+# exactly PEFT's `lora_A.weight`, so the two conventions meet with no transpose here.
+# The scale is also PEFT's own: alpha defaults to r, so "no alpha" is scale 1.0 in
+# both readings.
+#
+# THE MAPPING, and where it was MEASURED rather than assumed.  The GGUF fuses the
+# source's per-expert w1 (gate) and w3 (up) into one `ffn_gate_up_exps` tensor and
+# keeps w2 as `ffn_down_exps` (layout.md §6).  WHICH HALF of the fused out axis is
+# which was measured on this host against the checkpoint's own FP8 weights
+# (/tmp/lora-probe/order_probe.py, probe output quoted in the unit's report): expert
+# 0 of blk.0.ffn_gate_up_exps has rows [0,2048) equal to layers.0.experts.0.w1
+# ELEMENTWISE (corr 1.00000000, max |diff| 3.0e-8, i.e. the F16 store) and rows
+# [2048,4096) equal to w3 (same), while the crossed pairs give corr 0.0049 and a
+# wrong-expert control gives 0.0027.  So, in the override tensor's own numpy
+# (ne1=out, ne0=in) space:
+#     w1 / gate_proj -> ffn_gate_up_exps rows [0, ne1/2)
+#     w3 / up_proj   -> ffn_gate_up_exps rows [ne1/2, ne1)
+#     w2 / down_proj -> ffn_down_exps, the whole out axis
+# A per-expert delta is then numpy (out, in) = the override's own (ne1, ne0) slice,
+# which is the space `--delta` already consumes, so no new payload path exists.
+#
+# THE HAZARD IS THE DESIGN CONSTRAINT.  A pair with NO expert index is a SHARED 2-D
+# update; against a 3-D expert tensor llama-export-lora ABORTS (GGML_ASSERT(
+# ggml_can_repeat), exit 134, MEASURED twice) and the runtime kernel would broadcast
+# one delta to all 128 experts.  That shape is REFUSED by name here, never applied.
+LORA_A_SUFFIX = ".lora_A.weight"
+LORA_B_SUFFIX = ".lora_B.weight"
+# PEFT prefixes the module path with `base_model.model.`.  The two model prefixes are
+# the two checkpoint trees this project has on disk (layout.md §6's SOURCE names
+# `layers.<l>.experts.<e>.w1`; the HF-format tree names
+# `language_model.model.layers.<l>.mlp.experts.<e>.gate_proj`).  The list is FINITE:
+# anything outside it is a named refusal, never a guessed strip.
+LORA_PREFIXES = ("base_model.model.",)
+LORA_MODEL_PREFIXES = ("language_model.model.", "model.", "")
+LORA_MODULE_RE = re.compile(
+    r"^layers\.(\d+)\.(?:mlp\.)?experts\.(\d+)\.(w1|w2|w3|gate_proj|up_proj|down_proj)$")
+LORA_SHARED_RE = re.compile(
+    r"^layers\.(\d+)\.(?:mlp\.)?experts\.(gate_up_proj|w1|w2|w3|gate_proj|up_proj|down_proj)$")
+# projection -> (GGUF logical, block index in the fused out axis)
+LORA_PROJ = {
+    "w1": ("ffn_gate_up_exps", 0), "gate_proj": ("ffn_gate_up_exps", 0),
+    "w3": ("ffn_gate_up_exps", 1), "up_proj": ("ffn_gate_up_exps", 1),
+    "w2": ("ffn_down_exps", 0), "down_proj": ("ffn_down_exps", 0),
+}
+LORA_FUSED = "ffn_gate_up_exps"
+# Dense module paths this architecture HAS but this overlay path CANNOT express: an
+# expert-slice override is the only override kind that carries a merged delta (a
+# whole-tensor one is an identity cut), so a dense-module LoRA has nowhere to land.
+# A RECOGNISED dense name is counted and declared (never applied silently); an
+# unrecognised one is a named refusal, so a new architecture fails loudly.
+LORA_DENSE_RE = re.compile(
+    r"^layers\.(\d+)\.(?:"
+    r"attention\.(?:wq_a|wq_b|wkv_a_with_mqa|wkv_b|wo)"
+    r"|self_attn\.(?:q_proj|k_proj|v_proj|o_proj|kv_a_proj_with_mqa|kv_b_proj"
+    r"|q_a_proj|q_b_proj)"
+    r"|mlp\.gate|mlp\.shared_experts\.(?:gate_proj|up_proj|down_proj)"
+    r"|ffn_gate_inp"
+    r")$")
+LORA_CONFIG_REFS = ("rank_pattern", "alpha_pattern")
+
+
+def lora_scale(alpha: float | None, rank: int) -> float:
+    """`alpha/rank` when the adapter declares alpha, else 1.0 — MEASURED, not read.
+
+    The two competing conventions this rules out are alpha/sqrt(rank) (rsLoRA, which
+    is refused at load rather than silently mis-scaled) and pre-scaled alpha.
+    """
+    if alpha is None:
+        return 1.0
+    return float(alpha) / float(rank)
+
+
+def _strip_lora_prefix(module: str) -> str | None:
+    for p in LORA_PREFIXES:
+        if module.startswith(p):
+            module = module[len(p):]
+            break
+    for p in LORA_MODEL_PREFIXES:
+        if p and module.startswith(p):
+            return module[len(p):]
+    return module if "" in LORA_MODEL_PREFIXES else None
+
+
+class LoraAdapter:
+    """A PEFT adapter, read ONCE: one 2-D (A, B) pair per (layer, expert, logical, block).
+
+    `pairs[(layer, expert, logical, block)] = (A float32 (r, in), B float32 (out, r))`
+    — PEFT's own layout, which is also ggml's lora_a/lora_b up to the transpose
+    GGUF already applies to a numpy-order tensor.  Nothing is scaled at load: the
+    scale is applied once, in `delta_for`.
+    """
+
+    def __init__(self, path: Path, cfg_path: Path, pairs: dict, alpha: float | None,
+                 rank: int, dense: list[str]) -> None:
+        self.path = path
+        self.cfg_path = cfg_path
+        self.pairs = pairs
+        self.alpha = alpha
+        self.rank = rank
+        self.scale = lora_scale(alpha, rank)
+        self.dense = dense
+        self.sha = sha256_file(path)
+        self.cfg_sha = sha256_file(cfg_path)
+
+    def bounds(self, logical: str, ne1: int, what: str) -> list[tuple[int, int]]:
+        """The (lo, hi) row blocks of the fused out axis for one logical."""
+        if logical == LORA_FUSED:
+            if ne1 % 2 or ne1 == 0:
+                raise SystemExit(
+                    f"FATAL: [lora:shape-mismatch] {what}: the base tensor's ne1={ne1} is not "
+                    f"even, so it is not a w1|w3 fusion and an adapter pair cannot be placed")
+            return [(0, ne1 // 2), (ne1 // 2, ne1)]
+        return [(0, ne1)]
+
+    def pair(self, layer: int, expert: int, logical: str, block: int, lo: int, hi: int,
+             ne0: int, what: str) -> tuple[np.ndarray, np.ndarray]:
+        key = (layer, expert, logical, block)
+        got = self.pairs.get(key)
+        if got is None:
+            raise SystemExit(
+                f"FATAL: [lora:uncovered-expert] {what}: the adapter has NO pair for layer "
+                f"{layer} expert {expert} of '{logical}' block {block} — an override DECLARES "
+                f"these experts covered, so leaving one at its base value would be a variant "
+                f"that silently is not the adapter. Override the experts the adapter covers, "
+                f"or train/convert a pair for this one")
+        a, b = got
+        if a.shape != (self.rank, ne0):
+            raise SystemExit(
+                f"FATAL: [lora:shape-mismatch] {what}: layer {layer} expert {expert} "
+                f"'{logical}' block {block}: lora_A is {a.shape} but the base tensor's in axis "
+                f"is ne0={ne0} and the rank is {self.rank} — expected {(self.rank, ne0)} "
+                f"(PEFT lora_A.weight is (r, in); ggml lora_a ne=(in, r) is its transpose)")
+        if b.shape != (hi - lo, self.rank):
+            raise SystemExit(
+                f"FATAL: [lora:shape-mismatch] {what}: layer {layer} expert {expert} "
+                f"'{logical}' block {block}: lora_B is {b.shape} but rows [{lo},{hi}) of the "
+                f"base tensor's out axis need {(hi - lo, self.rank)} (PEFT lora_B.weight is "
+                f"(out, r))")
+        return a, b
+
+    def check_for(self, layer: int, logical: str, ids: list[int], ne01, what: str) -> None:
+        """Shape/coverage checks for ONE override — no arithmetic, used before any write."""
+        ne0, ne1 = int(ne01[0]), int(ne01[1])
+        for block, (lo, hi) in enumerate(self.bounds(logical, ne1, what)):
+            for e in ids:
+                self.pair(layer, e, logical, block, lo, hi, ne0, what)
+
+    def delta_for(self, layer: int, logical: str, ids: list[int], ne01, what: str) -> np.ndarray:
+        """The (len(ids), ne1, ne0) float32 delta — `alpha/rank * B @ A` per block.
+
+        FLOAT32, not F16: the arithmetic reference is as wide as this tree can hold, so
+        the only rounding is `merged_f16`'s single F16 store.  `--delta` arrives already
+        F16 because a GGUF holds F16; an adapter is a rank-r FACTORISATION, and
+        rounding the product down before the merge would throw away precision that
+        costs nothing to keep.
+        """
+        ne0, ne1 = int(ne01[0]), int(ne01[1])
+        out = np.zeros((len(ids), ne1, ne0), dtype=np.float32)
+        for j, e in enumerate(ids):
+            for block, (lo, hi) in enumerate(self.bounds(logical, ne1, what)):
+                a, b = self.pair(layer, e, logical, block, lo, hi, ne0, what)
+                out[j, lo:hi] = np.float32(self.scale) * (b @ a)
+        return out
+
+    def map_note(self, ne1_by_logical: dict[str, int]) -> str:
+        """The row-block placement, STAMPED: a wrong half is invisible once merged."""
+        parts = []
+        for logical in sorted(ne1_by_logical):
+            ne1 = ne1_by_logical[logical]
+            if logical == LORA_FUSED:
+                h = ne1 // 2
+                parts.append(f"{logical}[w1:0:{h},w3:{h}:{ne1}]")
+            else:
+                parts.append(f"{logical}[w2:0:{ne1}]")
+        return ";".join(parts)
+
+
+def load_lora(path: Path, config_path: Path | None) -> LoraAdapter:
+    """Read a PEFT safetensors adapter.  EVERY refusal here is NAMED and pre-write.
+
+    Accepted: `<module>.lora_A.weight` (r, in) + `<module>.lora_B.weight` (out, r), one
+    pair per (expert, projection), module paths as in layout.md §6 or their HF aliases.
+    An adapter is a FORMAT CONTRACT, so what cannot be honoured is refused rather than
+    approximated: rsLoRA/DoRA/per-module rank or alpha (a different scale), a bias or
+    a >2-D tensor (not a weight update this format can carry), a shared pair (the
+    abort shape), a duplicated or half pair (an ambiguous or missing factor).
+    """
+    real = need(path, "--lora")
+    if config_path is not None:
+        cfg_path = need(config_path, "--lora-config")
+    else:
+        cand = real.parent / "adapter_config.json"
+        if not cand.is_file():
+            raise SystemExit(
+                f"FATAL: [lora:config-missing] no {cand.name} beside {real.name} and no "
+                f"--lora-config given. The config is where alpha comes from, and alpha IS the "
+                f"merge scale (MEASURED: alpha/rank, or 1.0 when absent) — guessing it would "
+                f"silently rescale every delta in the file")
+        cfg_path = cand
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"FATAL: [lora:config-missing] cannot read {cfg_path}: {e}")
+
+    if cfg.get("peft_type") not in (None, "LORA"):
+        raise SystemExit(f"FATAL: [lora:unsupported-config] peft_type="
+                         f"{cfg.get('peft_type')!r} is not LORA")
+    if cfg.get("use_rslora"):
+        raise SystemExit(
+            "FATAL: [lora:unsupported-config] use_rslora=true — rsLoRA's scale is "
+            "alpha/sqrt(rank), and the merge scale llama.cpp applies (and this tool "
+            "reproduces) is alpha/rank. Applying one to an adapter trained with the other "
+            "silently rescales every delta by sqrt(rank)")
+    if cfg.get("use_dora"):
+        raise SystemExit(
+            "FATAL: [lora:unsupported-config] use_dora=true — DoRA's update is not B@A; it "
+            "scales by the base weight's column norms, which a plain rank-r product cannot "
+            "reproduce")
+    for key in LORA_CONFIG_REFS:
+        if cfg.get(key):
+            raise SystemExit(
+                f"FATAL: [lora:unsupported-config] {key} is non-empty — a per-module rank or "
+                f"alpha is not one scale; folding it into a single alpha/rank would silently "
+                f"mis-scale the modules it names")
+    alpha = cfg.get("lora_alpha")
+    if alpha is not None:
+        if float(alpha) == 0.0:
+            raise SystemExit(
+                "FATAL: [lora:unsupported-config] lora_alpha=0 — llama.cpp's scale test is "
+                "`alpha ? ... : user_scale`, so 0 means ABSENT there (scale 1.0) while PEFT "
+                "would compute 0 (a no-op). Refusing to pick one for you")
+        alpha = float(alpha)
+    cfg_rank = cfg.get("r", cfg.get("rank"))
+
+    try:
+        from safetensors import safe_open
+    except ImportError as e:  # pragma: no cover - environment error, not logic
+        raise SystemExit(f"FATAL: [lora:tools] --lora needs safetensors ({e}); use "
+                         f"venvs/convert/bin/python3")
+
+    pairs: dict[tuple[int, int, str, int], tuple[np.ndarray, np.ndarray]] = {}
+    half_a: dict[tuple[int, int, str, int], np.ndarray] = {}
+    half_b: dict[tuple[int, int, str, int], np.ndarray] = {}
+    dense: list[str] = []
+    seen_dense: set[str] = set()
+    rank = -1
+
+    def classify(key: str) -> tuple[str, str]:
+        if key.endswith(LORA_A_SUFFIX):
+            return key[:-len(LORA_A_SUFFIX)], "A"
+        if key.endswith(LORA_B_SUFFIX):
+            return key[:-len(LORA_B_SUFFIX)], "B"
+        raise SystemExit(
+            f"FATAL: [lora:unmappable-module] {real.name}: '{key}' is neither "
+            f"<module>{LORA_A_SUFFIX} nor <module>{LORA_B_SUFFIX} — a tensor this format "
+            f"cannot place (a DoRA magnitude vector and an embedding adapter both land here; "
+            f"a bias delta is not a weight update at all)")
+
+    with safe_open(str(real), framework="pt") as f:
+        for key in f.keys():
+            module, which = classify(key)
+            bare = _strip_lora_prefix(module)
+            m = LORA_MODULE_RE.match(bare) if bare else None
+            if m is None:
+                if bare and LORA_SHARED_RE.match(bare):
+                    raise SystemExit(
+                        f"FATAL: [lora:shared-pair-on-expert-tensor] {real.name}: '{key}' "
+                        f"targets '{bare}', which has NO expert index. The base tensor "
+                        f"'ffn_gate_up_exps'/'ffn_down_exps' is 3-D (one weight per expert), so "
+                        f"a 2-D pair here is ONE SHARED update: llama-export-lora ABORTS on "
+                        f"exactly this shape (GGML_ASSERT(ggml_can_repeat), exit 134, MEASURED) "
+                        f"and the runtime kernel would broadcast it to all 128 experts. Emit one "
+                        f"pair per expert (e.g. '...experts.<e>.w1' / '.w3' / '.w2') instead — "
+                        f"this tool will not apply one delta to 128 experts")
+                if bare and LORA_DENSE_RE.match(bare):
+                    if bare not in seen_dense:
+                        seen_dense.add(bare)
+                        dense.append(bare)
+                    continue
+                raise SystemExit(
+                    f"FATAL: [lora:unmappable-module] {real.name}: '{key}' -> '{bare}' matches "
+                    f"no module this tool can place. Accepted: "
+                    f"'layers.<l>.experts.<e>.(w1|w2|w3) or (.gate_proj|.up_proj|.down_proj)', "
+                    f"optionally under 'base_model.model.' and one of "
+                    f"{[p for p in LORA_MODEL_PREFIXES if p]}. An unmappable name is refused "
+                    f"rather than skipped: a skipped pair is a variant that silently is not "
+                    f"the adapter")
+            layer, expert, proj = int(m.group(1)), int(m.group(2)), m.group(3)
+            logical, block = LORA_PROJ[proj]
+            arr = f.get_tensor(key).to(dtype=_torch_f32()).numpy()
+            if arr.ndim != 2:
+                raise SystemExit(
+                    f"FATAL: [lora:unsupported-tensor] {real.name}: '{key}' is {arr.ndim}-D "
+                    f"{tuple(arr.shape)} — this path carries ONE 2-D pair per (expert, "
+                    f"projection). A batched pair cannot say which half of a fused "
+                    f"gate_up axis its rows mean, and a broadcast pair is the abort shape")
+            arr = np.ascontiguousarray(arr, dtype=np.float32)
+            k = (layer, expert, logical, block)
+            r_here = arr.shape[0] if which == "A" else arr.shape[1]
+            if rank < 0:
+                rank = r_here
+            elif r_here != rank:
+                raise SystemExit(
+                    f"FATAL: [lora:rank-mismatch] {real.name}: '{key}' has rank {r_here} but "
+                    f"another pair in the same adapter has {rank} — one adapter, one scale "
+                    f"(alpha/rank), so a mixed-rank adapter cannot be merged with a single "
+                    f"scale")
+            if which == "A":
+                mine, other = half_a, half_b
+            else:
+                mine, other = half_b, half_a
+            if k in mine or k in pairs:
+                raise SystemExit(
+                    f"FATAL: [lora:duplicate-pair] {real.name}: '{key}' is a SECOND lora_{which} "
+                    f"for layer {layer} expert {expert} '{logical}' block {block} — two names "
+                    f"map to one (expert, projection) (e.g. 'w1' and 'gate_proj'), so which "
+                    f"factor wins would be arbitrary")
+            if k in other:
+                b_arr = other.pop(k)
+                pairs[k] = (arr, b_arr) if which == "A" else (b_arr, arr)
+            else:
+                mine[k] = arr
+
+    if half_a or half_b:
+        missing = sorted(set(half_a) | set(half_b))
+        k0 = missing[0]
+        raise SystemExit(
+            f"FATAL: [lora:incomplete-pair] {real.name}: {len(missing)} pair(s) have only one "
+            f"factor (e.g. layer {k0[0]} expert {k0[1]} '{k0[2]}' block {k0[3]}) — a LoRA "
+            f"update needs BOTH A and B; merging one alone would be a different update")
+    if not pairs:
+        raise SystemExit(f"FATAL: [lora:unmappable-module] {real.name} carries no usable "
+                         f"expert pair ({len(dense)} dense module(s) and nothing else)")
+    if cfg_rank is not None and int(cfg_rank) != rank:
+        raise SystemExit(
+            f"FATAL: [lora:rank-mismatch] the config declares r={cfg_rank} but the tensors' "
+            f"rank is {rank} — the scale is alpha/rank, so the two cannot disagree")
+
+    return LoraAdapter(real, cfg_path, pairs, alpha, rank, dense)
+
+
+def _torch_f32():
+    import torch
+    return torch.float32
+
+
+def lora_plan_report(ad: LoraAdapter, resolved: list) -> str:
+    """Refuse every adapter/override disagreement BEFORE anything is written, and
+    return the ONE provenance note the whole file carries.
+
+    Two aggregates can only be made here, and both are DECLARED rather than silent:
+    the pairs this build APPLIES, and the pairs it does not — a recognised dense
+    module (this overlay path has nowhere to put a dense delta) and an expert pair
+    that no override covers.  A partial application is legitimate (an 8-hot-expert
+    overlay IS one), but it must be visible in the file and in the log, because
+    "the adapter's variant" and "part of the adapter's variant" are different
+    artifacts.
+    """
+    used: set[tuple[int, int, str, int]] = set()
+    ne1_by_logical: dict[str, int] = {}
+    for k, layer, logical, ids, kind, seg in resolved:
+        what = f"blk.{layer}.{logical} ov{k}"
+        ad.check_for(layer, logical, ids, seg.ne01, what)
+        ne1 = int(seg.ne01[1])
+        ne1_by_logical[logical] = ne1
+        for e in ids:
+            for block in range(len(ad.bounds(logical, ne1, what))):
+                used.add((layer, e, logical, block))
+    unused = sorted(set(ad.pairs) - used)
+    if unused:
+        per_logical: dict[str, int] = {}
+        for (_, _, logical, _) in unused:
+            per_logical[logical] = per_logical.get(logical, 0) + 1
+        print(f"WARNING     : {len(unused)} adapter pair(s) are NOT applied "
+              f"({', '.join(f'{v} {k}' for k, v in sorted(per_logical.items()))}) — no "
+              f"--override covers those (layer, expert). The overlay is PART of this adapter, "
+              f"not all of it; declare the remaining experts to apply them")
+    if ad.dense:
+        print(f"WARNING     : {len(ad.dense)} recognised DENSE module(s) are NOT applied "
+              f"({', '.join(sorted(ad.dense)[:3])}"
+              f"{' ...' if len(ad.dense) > 3 else ''}) — an expert-slice override is the only "
+              f"override kind that carries a merged delta, so this format has nowhere to put a "
+              f"dense-module LoRA. Their absence is declared below, never silent")
+    alpha_note = "absent" if ad.alpha is None else f"{ad.alpha:g}"
+    return (f"lora:sha256={ad.sha},config={ad.cfg_sha},alpha={alpha_note},rank={ad.rank},"
+            f"scale={ad.scale:.10g},applied={len(used)},unapplied={len(unused)},"
+            f"dense_skipped={len(ad.dense)},map={ad.map_note(ne1_by_logical)}")
+
+
 def write_slice_gguf(path: Path, src_reader, tensor_name: str, rows: np.ndarray) -> None:
     """A THROWAWAY GGUF holding only the override rows, quantisable by llama-quantize.
 
@@ -852,7 +1276,7 @@ def requantised_payload(*, base_name: str, layer: int, logical: str, ids: list[i
                         quant_type: str,
                         nthread: int, quantize_bin: Path, workdir: Path,
                         delta_path: Path | None, delta_synth: str | None,
-                        ov_name: str) -> dict:
+                        ov_name: str, lora=None, lora_note: str = "") -> dict:
     """cut the F16 rows -> merge the delta at F16 -> re-quantise with the base's spec.
 
     ONE implementation, used by BUILD and by --verify's reproduction mode, so the
@@ -868,7 +1292,12 @@ def requantised_payload(*, base_name: str, layer: int, logical: str, ids: list[i
     want_shape = (len(ids), seg.ne01[1], seg.ne01[0])
     if tuple(rows.shape) != want_shape:
         raise SystemExit(f"FATAL: {what}: cut shape {tuple(rows.shape)} != {want_shape}")
-    delta, delta_note = build_delta(ov_name, want_shape, rows, delta_path, delta_synth)
+    if lora is not None:
+        # The adapter path: alpha/rank * B @ A in F32, per expert and per fused block.
+        delta = lora.delta_for(layer, logical, ids, seg.ne01, what)
+        delta_note = lora_note
+    else:
+        delta, delta_note = build_delta(ov_name, want_shape, rows, delta_path, delta_synth)
     merged, merge_info = merged_f16(rows, delta)
 
     workdir.mkdir(parents=True, exist_ok=True)
@@ -907,7 +1336,8 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
           imatrix_path: Path | None = None, type_file: Path | None = None,
           quant_type: str = "IQ2_XXS", nthread: int = 8,
           quantize_bin: Path | None = None, workdir: Path | None = None,
-          delta_synth: str | None = None, input_sha: str | None = None) -> int:
+          delta_synth: str | None = None, input_sha: str | None = None,
+          lora: Path | None = None, lora_config: Path | None = None) -> int:
     real = need(base, "--base")
     out = out.resolve()
     check_write_scope(out)
@@ -921,6 +1351,13 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
                          "--requantise (merge at F16 then re-quantise with the base's own "
                          "spec, unit S1b) — they are different payload paths and the file must "
                          "declare which one produced it")
+    sources = [n for n, v in (("--lora", lora), ("--delta", delta),
+                              ("--delta-synth", delta_synth)) if v is not None]
+    if len(sources) > 1:
+        raise SystemExit(
+            f"FATAL: [lora:delta] {', '.join(sources)} are all delta SOURCES — give exactly "
+            f"one. Two would mean one is silently ignored while the file declares a merge it "
+            f"did not make")
     if requantise:
         missing = [n for n, v in (("--f16", f16), ("--imatrix", imatrix_path),
                                  ("--type-file", type_file), ("--llama-quantize",
@@ -937,7 +1374,7 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
                 "--requantise path both are DERIVED from the files actually used, so declaring "
                 "them is a second thing that can disagree with the first (V4.4)")
     else:
-        if delta is not None or delta_synth is not None:
+        if delta is not None or delta_synth is not None or lora is not None:
             raise SystemExit("FATAL: a delta is merged into a QUANTISED payload; it has no "
                              "meaning on the --identity path, which copies the base's bytes "
                              "verbatim and must produce exactly those bytes (§5.3)")
@@ -993,6 +1430,23 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
                 f"so §5.3 has nothing to say about it. Use --identity for those tensors and a "
                 f"separate overlay for the quantised experts")
 
+    # The ADAPTER is read and CROSS-CHECKED against the whole override plan BEFORE the
+    # base is hashed and before anything is written: an adapter whose shapes disagree
+    # with the base, whose pairs miss a declared expert, or that cannot be placed at
+    # all must leave nothing behind.  (The delta itself is built inside
+    # requantised_payload, which --verify shares — one implementation, not two.)
+    lora_ad = None
+    lora_note = ""
+    if lora is not None:
+        lora_ad = load_lora(lora, lora_config)
+        print(f"adapter     : {lora_ad.path.name}  rank={lora_ad.rank}  "
+              f"alpha={'absent (scale 1.0)' if lora_ad.alpha is None else f'{lora_ad.alpha:g}'}"
+              f"  scale={lora_ad.scale:.10g} (= alpha/rank, MEASURED)  "
+              f"pairs={len(lora_ad.pairs)}  dense={len(lora_ad.dense)}")
+        lora_note = lora_plan_report(lora_ad, resolved)
+        print(f"  map       : {lora_ad.map_note({lg: int(seg.ne01[1]) for _, _, lg, _, _, seg in resolved})}")
+        print(f"  sha256    : {lora_ad.sha} (adapter), {lora_ad.cfg_sha} (config)")
+
     parent_sha = sha256_file(real)
     tool = tool_version()
 
@@ -1031,7 +1485,8 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
                 imatrix=imatrix_path, type_file=type_file,
                 quant_type=quant_type, nthread=nthread, quantize_bin=quantize_bin, workdir=wd,
                 delta_path=delta, delta_synth=delta_synth,
-                ov_name=f"blk.{layer}.{logical}.ov{k}.weight")
+                ov_name=f"blk.{layer}.{logical}.ov{k}.weight",
+                lora=lora_ad, lora_note=lora_note)
             payloads[k] = rp
             quant_prov[QUANT_FLAGS_KEY] = rp["flags"]
             quant_prov[QUANT_TOOL_KEY] = rp["tool"]
@@ -1315,7 +1770,8 @@ def parse_ids(entry: str) -> tuple[list[int] | None, str]:
 def verify(base: Path, overlay: Path, f16: Path | None = None, imatrix_path: Path | None = None,
            type_file: Path | None = None, quant_type: str | None = None, nthread: int = 8,
            quantize_bin: Path | None = None, workdir: Path | None = None,
-           delta: Path | None = None, delta_synth: str | None = None) -> int:
+           delta: Path | None = None, delta_synth: str | None = None,
+           lora: Path | None = None, lora_config: Path | None = None) -> int:
     real = need(base, "--base")
     ov = need(overlay, "--overlay")
     a = open_gguf(real, "base")
@@ -1519,6 +1975,35 @@ def verify(base: Path, overlay: Path, f16: Path | None = None, imatrix_path: Pat
               f"{imatrix_path.name}, --tensor-type-file {type_file.name}, {quant_type}, "
               f"nthread {nthread}")
 
+    # ---- the ADAPTER for the reproduction, if this overlay was built from one ------
+    lora_ad = None
+    if lora is not None:
+        if not repro:
+            raise SystemExit(
+                "FATAL: [lora:path] --lora is only meaningful WITH --f16: it re-derives the "
+                "payload from the adapter, and a reproduction needs the whole declared spec "
+                "(--imatrix/--type-file/--llama-quantize) to be a reproduction at all")
+        lora_ad = load_lora(lora, lora_config)
+        declared_delta = (str(b.fields[MERGE_DELTA_KEY].contents())
+                          if MERGE_DELTA_KEY in b.fields else "")
+        # The adapter handed in must be the one the file SAYS built it — otherwise every
+        # reproduction below would be a fresh build agreeing with nothing (the same rule
+        # the imatrix/type-file are held to).
+        if not declared_delta.startswith("lora:"):
+            errors.append(f"reproduction: --lora was given but the overlay declares "
+                          f"{MERGE_DELTA_KEY}={declared_delta or 'ABSENT'} — this payload was "
+                          f"not built from an adapter")
+            repro = False
+        elif f"sha256={lora_ad.sha}" not in declared_delta:
+            errors.append(f"reproduction: the adapter's sha256 {lora_ad.sha} is not the "
+                          f"declared {MERGE_DELTA_KEY} ({declared_delta}) — not the adapter "
+                          f"that built this overlay")
+            repro = False
+        else:
+            print(f"reproduce   : adapter {lora_ad.path.name} rank={lora_ad.rank} "
+                  f"alpha={lora_ad.alpha} scale={lora_ad.scale:.10g} — sha256 matches the "
+                  f"declared merge_delta")
+
     # ---- per tensor: kind from the base's rank, then THE ROW ARITHMETIC ---
     n_repro = 0
     n_repro_units = 0
@@ -1652,7 +2137,10 @@ def verify(base: Path, overlay: Path, f16: Path | None = None, imatrix_path: Pat
                         imatrix=imatrix_path, type_file=type_file,
                         quant_type=quant_type or "IQ2_XXS", nthread=nthread,
                         quantize_bin=quantize_bin, workdir=rd_wd, delta_path=delta,
-                        delta_synth=delta_synth, ov_name=name)
+                        delta_synth=delta_synth, ov_name=name, lora=lora_ad,
+                        lora_note=(f"lora:sha256={lora_ad.sha},rank={lora_ad.rank},"
+                                   f"scale={lora_ad.scale:.10g}"
+                                   if lora_ad is not None else ""))
                     exp = np.ascontiguousarray(rp["payload"]).reshape(-1)
                     act = np.frombuffer(os.pread(fd_b, exp.size, t.data_offset), dtype=np.uint8)
                     if act.size != exp.size:
@@ -1885,6 +2373,16 @@ def main() -> None:
                    help="a DETERMINISTIC SYNTHETIC F16 delta, N(0,(RELRMS*rms(slice))^2), for "
                         "artifacts built before any adapter exists. Stamped as "
                         "merge_delta=synthetic:... so it can never be read as a trained one")
+    p.add_argument("--lora", type=Path, default=None, metavar="ADAPTER.safetensors",
+                   help="a PEFT safetensors ADAPTER to merge (unit LORA): one 2-D "
+                        "lora_A/lora_B pair per (layer, expert, w1|w2|w3), merged as "
+                        "alpha/rank * B@A per expert into the F16 slice before the EXISTING "
+                        "re-quantisation. Requires --requantise; exclusive with --delta/"
+                        "--delta-synth")
+    p.add_argument("--lora-config", type=Path, default=None, metavar="adapter_config.json",
+                   help="the adapter's PEFT config, where alpha comes from (default: "
+                        "adapter_config.json beside --lora; REQUIRED to exist — alpha IS the "
+                        "merge scale, so it is never guessed)")
     p.add_argument("--manifest", type=Path, default=None,
                    help="optional NON-AUTHORITATIVE side manifest.json (a shelf label)")
     p.add_argument("--imatrix-sha256", type=str, default=None, metavar="HEX",
@@ -1911,7 +2409,8 @@ def main() -> None:
                         quant_type=args.quant_type,
                         nthread=args.nthread, quantize_bin=args.llama_quantize,
                         workdir=args.workdir, delta=args.delta,
-                        delta_synth=args.delta_synth))
+                        delta_synth=args.delta_synth,
+                        lora=args.lora, lora_config=args.lora_config))
     if args.base is None or args.out is None:
         raise SystemExit("FATAL: give --base and --out (or --verify)")
     sys.exit(build(args.base, args.out, args.override, args.identity, args.delta, args.manifest,
@@ -1920,7 +2419,8 @@ def main() -> None:
                    type_file=args.type_file, quant_type=args.quant_type or "IQ2_XXS",
                    nthread=args.nthread, quantize_bin=args.llama_quantize,
                    workdir=args.workdir, delta_synth=args.delta_synth,
-                   input_sha=args.input_sha256))
+                   input_sha=args.input_sha256, lora=args.lora,
+                   lora_config=args.lora_config))
 
 
 if __name__ == "__main__":
