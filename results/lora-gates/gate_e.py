@@ -43,10 +43,15 @@ C.check("taillis.overlay_digest.ov0" in f, "per-tensor payload digest present",
         f"{f.get('taillis.overlay_digest.ov0')}")
 C.check("taillis.overlay_identity" not in f,
         "overlay_identity ABSENT (derived: the payload really differs from the base)", "")
+# N2: the FULL note, predicted before the build and asserted by EQUALITY. This artifact
+# is one down-exps override over experts 0,1 of an adapter that also carries w1/w3, so
+# applied=2 and unapplied=4 are predicted, not observed.
 md = str(f.get("taillis.provenance.merge_delta"))
-C.check(md.startswith("lora:sha256=") and C.sha256(sw) in md,
-        "merge_delta names the adapter by sha256 (with config, alpha, rank, scale, map)",
-        md)
+predicted = (f"lora:sha256={C.sha256(sw)},config={C.sha256(sw.parent / 'adapter_config.json')},"
+             f"alpha=2,rank=4,scale=0.5,applied=2,unapplied=4,dense_skipped=0,"
+             f"map=ffn_down_exps[w2:0:4096]")
+C.check(md == predicted, "merge_delta EQUALS the string predicted before the build",
+        f"\n     predicted: {predicted}\n     got      : {md}")
 
 v = subprocess.run([str(C.PY), str(C.TOOL), "--verify", "--base", str(C.BASE),
                     "--overlay", str(out)], capture_output=True, text=True)
@@ -87,8 +92,42 @@ print(f"\nverify (reproduce from the adapter) exit {v3.returncode}")
 C.check(v3.returncode == 0, "--verify --f16 --lora REPRODUCES the payload", "")
 C.check("BYTE-IDENTICAL" in v3.stdout, "the reproduction is byte-identical",
         [l.strip() for l in v3.stdout.splitlines() if "reproduce" in l.lower()][-2:])
-C.check("sha256 matches the declared merge_delta" in v3.stdout,
+C.check("sha256 AND config match the declared merge_delta" in v3.stdout,
         "the adapter's sha256 was matched against the file's declaration", "")
+
+# ---- S1: THE MISSING-INPUT DIAGNOSIS, not an accusation of corruption --------------
+# A lora-built overlay verified WITH --f16 but WITHOUT --lora re-derives with no delta and
+# cannot match. That used to be reported as "corrupted or built from other inputs" — which
+# blames the file for the CALLER's omission. It must name the omission instead.
+v5 = subprocess.run([str(C.PY), str(C.TOOL), "--verify", "--base", str(C.BASE),
+                     "--overlay", str(out), "--f16", str(C.F16),
+                     "--imatrix", str(C.IMATRIX), "--type-file", str(C.TYPES),
+                     "--llama-quantize", str(C.QUANTIZE),
+                     "--workdir", str(C.WORK / "gate-e-omitted")],
+                    capture_output=True, text=True)
+print(f"\nverify (adapter OMITTED) exit {v5.returncode}")
+C.check(v5.returncode != 0, "--verify without --lora on a lora-built overlay FAILS", "")
+C.check("this overlay DECLARES a merge" in v5.stdout and "--lora ADAPTER --lora-config" in v5.stdout,
+        "it names the OMISSION and the argument to pass",
+        [l[:150] for l in v5.stdout.splitlines() if "DECLARES a merge" in l][:1])
+C.check("MISSING INPUT, not evidence that the file is corrupt" in v5.stdout,
+        "it says explicitly that this is NOT corruption", "")
+C.check("corrupted or built from other inputs" not in v5.stdout,
+        "the CORRUPTION message is NOT printed (the file is innocent)", "")
+C.check("reproduction:" in v5.stdout and "does NOT REPRODUCE" not in v5.stdout,
+        "the reproduction is skipped, not run and then failed", "")
+
+# ---- S1b: delta-source exclusivity on the VERIFY side, same words as build --------
+v6 = subprocess.run([str(C.PY), str(C.TOOL), "--verify", "--base", str(C.BASE),
+                     "--overlay", str(out), "--f16", str(C.F16),
+                     "--imatrix", str(C.IMATRIX), "--type-file", str(C.TYPES),
+                     "--llama-quantize", str(C.QUANTIZE), "--lora", str(sw),
+                     "--delta-synth", "1:0.02"],
+                    capture_output=True, text=True)
+print(f"\nverify (--lora AND --delta-synth) exit {v6.returncode}")
+C.check(v6.returncode != 0 and "[lora:delta]" in (v6.stdout + v6.stderr),
+        "--verify refuses two delta sources, with build's own [lora:delta] wording",
+        [l[:150] for l in (v6.stdout + v6.stderr).splitlines() if "lora:delta" in l][:1])
 
 # ---- a DIFFERENT adapter must be refused, not used --------------------------------
 v4 = subprocess.run([str(C.PY), str(C.TOOL), "--verify", "--base", str(C.BASE),
@@ -98,7 +137,7 @@ v4 = subprocess.run([str(C.PY), str(C.TOOL), "--verify", "--base", str(C.BASE),
                      "--workdir", str(C.WORK / "gate-e-repro2"), "--lora", str(other)],
                     capture_output=True, text=True)
 print(f"\nverify (WRONG adapter) exit {v4.returncode}")
-C.check(v4.returncode != 0 and "not the adapter that built this overlay" in v4.stdout,
-        "a --lora that is not the declared one is REFUSED",
+C.check(v4.returncode != 0 and "is not the one declared" in v4.stdout,
+        "a --lora that is not the declared one is REFUSED (sha256 AND config compared)",
         [l[:140] for l in v4.stdout.splitlines() if l.startswith("FAIL")][:1])
 C.finish("gate-e")

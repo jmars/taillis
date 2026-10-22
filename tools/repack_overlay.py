@@ -742,7 +742,8 @@ def merged_f16(rows: np.ndarray, delta: np.ndarray | None) -> tuple[np.ndarray, 
 # source's per-expert w1 (gate) and w3 (up) into one `ffn_gate_up_exps` tensor and
 # keeps w2 as `ffn_down_exps` (layout.md §6).  WHICH HALF of the fused out axis is
 # which was measured on this host against the checkpoint's own FP8 weights
-# (/tmp/lora-probe/order_probe.py, probe output quoted in the unit's report): expert
+# (results/lora-gates/order_probe.py — re-runnable; its first home was wiped by a
+# machine reboot and the probe was re-written and re-measured, same numbers): expert
 # 0 of blk.0.ffn_gate_up_exps has rows [0,2048) equal to layers.0.experts.0.w1
 # ELEMENTWISE (corr 1.00000000, max |diff| 3.0e-8, i.e. the F16 store) and rows
 # [2048,4096) equal to w3 (same), while the crossed pairs give corr 0.0049 and a
@@ -852,12 +853,16 @@ class LoraAdapter:
         key = (layer, expert, logical, block)
         got = self.pairs.get(key)
         if got is None:
+            fused = (f" A FUSED logical needs BOTH halves for every expert: '{logical}' is "
+                     f"w1|w3, so a gate-only (or up-only) adapter cannot be merged into it — "
+                     f"half a fused tensor is not an overridable unit here."
+                     if logical == LORA_FUSED else "")
             raise SystemExit(
                 f"FATAL: [lora:uncovered-expert] {what}: the adapter has NO pair for layer "
                 f"{layer} expert {expert} of '{logical}' block {block} — an override DECLARES "
                 f"these experts covered, so leaving one at its base value would be a variant "
-                f"that silently is not the adapter. Override the experts the adapter covers, "
-                f"or train/convert a pair for this one")
+                f"that silently is not the adapter.{fused} Override the experts the adapter "
+                f"covers, or train/convert a pair for this one")
         a, b = got
         if a.shape != (self.rank, ne0):
             raise SystemExit(
@@ -1066,6 +1071,13 @@ def load_lora(path: Path, config_path: Path | None) -> LoraAdapter:
     if not pairs:
         raise SystemExit(f"FATAL: [lora:unmappable-module] {real.name} carries no usable "
                          f"expert pair ({len(dense)} dense module(s) and nothing else)")
+    if rank < 1:
+        # A (0, in) lora_A is constructible in safetensors, and `lora_scale` divides by the
+        # rank — so without this it is a bare ZeroDivisionError instead of a named refusal.
+        raise SystemExit(
+            f"FATAL: [lora:rank-mismatch] {real.name}: the tensors' rank is {rank} — the merge "
+            f"scale is alpha/rank, so rank 0 is not a degenerate adapter, it is an undefined "
+            f"one (and a rank-0 update is a no-op that would still be declared as a merge)")
     if cfg_rank is not None and int(cfg_rank) != rank:
         raise SystemExit(
             f"FATAL: [lora:rank-mismatch] the config declares r={cfg_rank} but the tensors' "
@@ -1329,6 +1341,23 @@ def requantised_payload(*, base_name: str, layer: int, logical: str, ids: list[i
             "quantised": quant_path}
 
 
+def one_delta_source(lora: Path | None, delta: Path | None,
+                     delta_synth: str | None) -> None:
+    """Exactly ONE delta source, on BUILD and on --verify alike.
+
+    Two sources would mean one is silently ignored — and `requantised_payload` prefers
+    the adapter, so `--verify --lora ... --delta ...` would reproduce from the adapter
+    while the caller believed the delta was in play.  One rule, one wording, both paths.
+    """
+    sources = [n for n, v in (("--lora", lora), ("--delta", delta),
+                              ("--delta-synth", delta_synth)) if v is not None]
+    if len(sources) > 1:
+        raise SystemExit(
+            f"FATAL: [lora:delta] {', '.join(sources)} are all delta SOURCES — give exactly "
+            f"one. Two would mean one is silently ignored while the file declares a merge it "
+            f"did not make")
+
+
 def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
           delta: Path | None, manifest: Path | None,
           imatrix: str | None, quant_flags: str | None,
@@ -1351,13 +1380,7 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
                          "--requantise (merge at F16 then re-quantise with the base's own "
                          "spec, unit S1b) — they are different payload paths and the file must "
                          "declare which one produced it")
-    sources = [n for n, v in (("--lora", lora), ("--delta", delta),
-                              ("--delta-synth", delta_synth)) if v is not None]
-    if len(sources) > 1:
-        raise SystemExit(
-            f"FATAL: [lora:delta] {', '.join(sources)} are all delta SOURCES — give exactly "
-            f"one. Two would mean one is silently ignored while the file declares a merge it "
-            f"did not make")
+    one_delta_source(lora, delta, delta_synth)
     if requantise:
         missing = [n for n, v in (("--f16", f16), ("--imatrix", imatrix_path),
                                  ("--type-file", type_file), ("--llama-quantize",
@@ -1976,33 +1999,55 @@ def verify(base: Path, overlay: Path, f16: Path | None = None, imatrix_path: Pat
               f"nthread {nthread}")
 
     # ---- the ADAPTER for the reproduction, if this overlay was built from one ------
+    # TWO DIRECTIONS, and the MISSING-INPUT one is the one that used to accuse an
+    # innocent party: a lora-built overlay verified WITHOUT --lora re-derives with no
+    # delta, cannot match, and used to be reported as "corrupted or built from other
+    # inputs" — while the file correctly declares its merge and the CALLER omitted the
+    # adapter.  So: the declared merge is read first, the omission is named as an
+    # omission, and "corrupted" is kept for the case where the declared inputs WERE
+    # supplied and still do not reproduce.
+    one_delta_source(lora, delta, delta_synth)
+    declared_delta = (str(b.fields[MERGE_DELTA_KEY].contents())
+                      if MERGE_DELTA_KEY in b.fields else "")
     lora_ad = None
-    if lora is not None:
-        if not repro:
-            raise SystemExit(
-                "FATAL: [lora:path] --lora is only meaningful WITH --f16: it re-derives the "
-                "payload from the adapter, and a reproduction needs the whole declared spec "
-                "(--imatrix/--type-file/--llama-quantize) to be a reproduction at all")
+    if lora is not None and not repro:
+        raise SystemExit(
+            "FATAL: [lora:path] --lora is only meaningful WITH --f16: it re-derives the "
+            "payload from the adapter, and a reproduction needs the whole declared spec "
+            "(--imatrix/--type-file/--llama-quantize) to be a reproduction at all")
+    if repro and declared_delta and lora is None and delta is None and delta_synth is None:
+        need_arg = ("--lora ADAPTER --lora-config CONFIG" if declared_delta.startswith("lora:")
+                    else "--delta FILE" if declared_delta.startswith("sha256:")
+                    else "--delta-synth SEED:RELRMS")
+        errors.append(
+            f"reproduction: this overlay DECLARES a merge — {MERGE_DELTA_KEY} = "
+            f"{declared_delta} — but no delta source was supplied, so the reproduction below "
+            f"would merge NOTHING and could not match. Pass {need_arg}. This is a MISSING "
+            f"INPUT, not evidence that the file is corrupt")
+        repro = False
+    if repro and lora is not None:
         lora_ad = load_lora(lora, lora_config)
-        declared_delta = (str(b.fields[MERGE_DELTA_KEY].contents())
-                          if MERGE_DELTA_KEY in b.fields else "")
         # The adapter handed in must be the one the file SAYS built it — otherwise every
         # reproduction below would be a fresh build agreeing with nothing (the same rule
-        # the imatrix/type-file are held to).
+        # the imatrix/type-file are held to).  Both halves of the identity are checked:
+        # the adapter's bytes AND its config, because a different alpha is a different
+        # build even when the rank (and therefore the tensors' shape) agrees.
         if not declared_delta.startswith("lora:"):
             errors.append(f"reproduction: --lora was given but the overlay declares "
                           f"{MERGE_DELTA_KEY}={declared_delta or 'ABSENT'} — this payload was "
                           f"not built from an adapter")
             repro = False
-        elif f"sha256={lora_ad.sha}" not in declared_delta:
-            errors.append(f"reproduction: the adapter's sha256 {lora_ad.sha} is not the "
-                          f"declared {MERGE_DELTA_KEY} ({declared_delta}) — not the adapter "
-                          f"that built this overlay")
+        elif (f"sha256={lora_ad.sha}," not in declared_delta
+              or f"config={lora_ad.cfg_sha}," not in declared_delta):
+            errors.append(f"reproduction: the adapter in hand (sha256 {lora_ad.sha}, config "
+                          f"{lora_ad.cfg_sha}) is not the one declared — {MERGE_DELTA_KEY} = "
+                          f"{declared_delta}. A different adapter or a different "
+                          f"alpha/rank/config is a different build")
             repro = False
         else:
             print(f"reproduce   : adapter {lora_ad.path.name} rank={lora_ad.rank} "
-                  f"alpha={lora_ad.alpha} scale={lora_ad.scale:.10g} — sha256 matches the "
-                  f"declared merge_delta")
+                  f"alpha={lora_ad.alpha} scale={lora_ad.scale:.10g} — sha256 AND config "
+                  f"match the declared merge_delta")
 
     # ---- per tensor: kind from the base's rank, then THE ROW ARITHMETIC ---
     n_repro = 0

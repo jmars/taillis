@@ -52,6 +52,12 @@ CASES = [
      "a delta is merged into a QUANTISED payload", BOTH),
     ("--lora together with --delta-synth", A("f-two", "--experts", "0"),
      ["--delta-synth", "1:0.02"], "lora:delta", BOTH),
+    ("--lora together with --delta", A("f-two-d", "--experts", "0"),
+     ["--delta", "/nonexistent/delta.gguf"], "lora:delta", BOTH),
+    ("a STACKED 3-D per-expert pair", A("f-ndim", "--experts", "0", "--broken", "ndim"),
+     [], "lora:unsupported-tensor", BOTH),
+    ("rank 0 (alpha/rank undefined)", A("f-rank0", "--experts", "0", "--broken", "rank0"),
+     [], "lora:rank-mismatch", BOTH),
 ]
 
 n_ok = 0

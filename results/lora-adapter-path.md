@@ -64,12 +64,12 @@ exist** (beside the adapter, or `--lora-config`): it is where `lora_alpha` comes
 | `lora:unmappable-module` | a module path that matches nothing accepted — or a tensor that is not a `lora_A`/`lora_B` at all (a DoRA magnitude vector, an embedding adapter, a bias delta). |
 | `lora:shape-mismatch` | `lora_A` ≠ `(r, ne0)`, or `lora_B` ≠ `(block rows, r)` — i.e. the adapter was not trained on this base tensor. |
 | `lora:rank-mismatch` | the tensors disagree on rank, or `adapter_config.r` disagrees with them. One adapter, one scale (`alpha/rank`). |
-| `lora:uncovered-expert` | an override id the adapter has no pair for: the file would DECLARE that expert and leave it at its base value. |
+| `lora:uncovered-expert` | an override id the adapter has no pair for: the file would DECLARE that expert and leave it at its base value. Note this is also what a **partial-projection** adapter gets (PEFT `target_modules=["gate_proj"]` alone): a FUSED logical needs **both** halves for every expert, because half a fused tensor is not an overridable unit — the refusal says so explicitly. |
 | `lora:incomplete-pair` | `lora_A` without `lora_B`. |
 | `lora:duplicate-pair` | two names for one `(expert, projection)` (e.g. `w1` and `gate_proj` both present). |
 | `lora:unsupported-config` | `use_rslora` (`alpha/sqrt(rank)`), `use_dora` (not `B@A` at all), non-empty `rank_pattern`/`alpha_pattern` (per-module scales), `lora_alpha: 0` (llama.cpp reads 0 as ABSENT; PEFT would read it as a no-op — refusing beats picking), `peft_type` ≠ LORA. |
 | `lora:config-missing` | no `adapter_config.json` — alpha cannot be guessed. |
-| `lora:delta` | `--lora` together with `--delta`/`--delta-synth` (one delta source, so none is silently ignored). |
+| `lora:delta` | `--lora` together with `--delta` **or** `--delta-synth`, on BUILD and on `--verify` alike (one delta source, so none is silently ignored — the reproduction prefers the adapter, so a delta supplied beside it would be dropped without a word). |
 | *(plain refusal)* | `--lora` with `--identity`: a delta merged into a quantised payload has no meaning on the verbatim-copy path. |
 
 ---
@@ -132,7 +132,7 @@ argument: rsLoRA is refused at load; `alpha/sqrt(rank)` fails gate (c)'s compari
 
 ## 3 · What was built
 
-One file, `tools/repack_overlay.py` (+510/−10, uncommitted):
+One file, `tools/repack_overlay.py` (landed as commit `cd55ee2`; the review-round fixes in §4 and §7 are a further uncommitted +70/−25 on top of it):
 
 | piece | where |
 |---|---|
@@ -177,6 +177,11 @@ An adapter with `lora_B` all zeros, against the same build with no adapter at al
 | `taillis.overlay_digest.ov1` | `55174723…17baca` | `55174723…17baca` |
 | `taillis.overlay_identity` | `true` (derived) | `true` (derived) |
 | KV keys | 16 | 17 (one extra: `merge_delta`) |
+
+**The one uncompared key is itself compared**: `merge_delta` is predicted in full before the
+build (both sha256s, alpha, rank, scale, applied/unapplied/dense_skipped and the row-block map are
+all known in advance) and asserted by **string equality**, and the no-adapter build is asserted to
+carry no such key at all — so the excluded key cannot smuggle arbitrary content either.
 
 **STATED DEVIATION.** The brief asked for a BYTE-IDENTICAL FILE; what holds is a byte-identical
 **payload**. The files cannot be identical and must not be: the zero-B build really did read an
@@ -269,12 +274,14 @@ Artifact `gate-e-lora.gguf` (5 375 424 B, sha256 `af9dd24f…60ee`): one overrid
 | `--verify` (base only) | **exit 0**, `GATES OK`; `payload dig : 1/1 tensor(s) hash to their declared digest` |
 | `--verify` on a copy with **one payload byte flipped** | **exit 1**, `PAYLOAD DIGEST MISMATCH — the file declares taillis.overlay_digest.ov0 = c77df7ea…` |
 | `--verify --f16 --lora <the adapter>` | **exit 0**, `reproduce : … BYTE-IDENTICAL to the re-quantised F16 slice (merge: lora:sha256=45541482…)`, `reproduced : 1/1 … (2 expert slab(s) compared)` |
-| `--verify --f16 --lora <a DIFFERENT adapter>` | **exit 1**, `the adapter's sha256 4fb906c8… is not the declared taillis.provenance.merge_delta` |
+| `--verify --f16 --lora <a DIFFERENT adapter>` | **exit 1**, `the adapter in hand (sha256 4fb906c8…, config a90e6c5b…) is not the one declared` — **both** halves of the identity are compared, because a different alpha is a different build even when the rank agrees |
+| `--verify --f16` with **no `--lora`** (the S1 case) | **exit 1**, `this overlay DECLARES a merge — taillis.provenance.merge_delta = lora:sha256=… — but no delta source was supplied … Pass --lora ADAPTER --lora-config CONFIG. This is a MISSING INPUT, not evidence that the file is corrupt` — and the corruption message is **absent** |
+| `--verify --f16 --lora … --delta-synth 1:0.02` | **exit 1**, `[lora:delta] --lora, --delta-synth are all delta SOURCES` — build's own wording, now enforced on the verify side too |
 
 The last row is the one worth keeping: the reproduction path does not merely re-run the quantiser,
 it refuses to run it on an adapter that is not the one the file says built it.
 
-### (f) REFUSALS, each NAMED — `exit 0`, 13/13
+### (f) REFUSALS, each NAMED — `exit 0`, 16/16
 
 Each case asserts a nonzero exit, the named code in the output, **and** that no `--out` file was
 created. All are refused before the base is hashed (≤ ~12 s each, dominated by opening the 35 GB
@@ -293,6 +300,9 @@ ok   DoRA                                                          lora:unsuppor
 ok   per-module alpha_pattern                                      lora:unsupported-config
 ok   --lora with --identity                                        (delta on a verbatim cut)
 ok   --lora together with --delta-synth                            lora:delta
+ok   --lora together with --delta                                  lora:delta
+ok   a STACKED 3-D per-expert pair                                 lora:unsupported-tensor
+ok   rank 0 (alpha/rank undefined)                                 lora:rank-mismatch
 ok   no adapter_config.json beside the adapter                     lora:config-missing
 ```
 
@@ -374,10 +384,62 @@ module name is a hard refusal, so a new architecture fails loudly instead of bei
 4. **Gate (c) is the dense case only** (§4c). The expert case stands on the numpy oracle, not on an
    executable reference, because a GGUF LoRA cannot express the shared form and a 3-D per-expert
    GGUF LoRA would only re-measure the convention gate (c) already pins.
-5. **`ne1` even is assumed to mean "w1|w3 fused 50/50".** MEASURED on this base (4096 = 2×2048).
-   A future arch with an unequal fusion would pass the evenness check and be placed wrongly; the
-   guard is `map=` in the artifact plus this paragraph, not a check the format can make.
+5. **`ne1` even is assumed to mean "w1|w3 fused 50/50"** — MEASURED on this base (4096 = 2×2048).
+   **CORRECTED after review (the first version of this paragraph named the wrong escape hatch):** an
+   *unequal* fusion is caught **loudly**, not silently — `pair()` demands `lora_B == (ne1/2, rank)`
+   rows (`tools/repack_overlay.py:876-880`), and neither of two unequal halves can equal `ne1/2`
+   (or `ne1` is odd and `bounds()` refuses outright), so an unequal-fusion base fails LOUDLY with
+   `lora:shape-mismatch` — on both halves, not on one. The
+   real silent residual is an **equal-halves ORDER swap** — a future converter emitting w3 first —
+   which no shape check can see, because both halves are the same width. That residual is guarded by
+   the probe (§2), by the `map=` stamp in the artifact and by this paragraph; it is not a check the
+   format can make.
 6. **The `--quant-type IQ2_XXS` positional and the base's type file** are S1b's recipe, unchanged;
    nothing here re-litigates the imatrix crop.
 7. **Cost:** the six gates take ~12 min wall clock, dominated by hashing the 35 GB base once per
    build (the F16's 238 GB is skipped with `--input-sha256`, as S1b does). No GPU, no gpu.lock.
+
+---
+
+## 8 · The review round (2026-10-20)
+
+An independent review (`handoff-taillis-lora-review`) returned **sound, 0 blockers, 1 should-fix,
+7 nice-to-have**. The should-fix and six of the seven nice-to-haves are applied; the seventh (N8)
+was documentation only and is now stated in §1. Numbers below are exit codes from the re-run.
+
+**S1 — THE MISDIAGNOSIS (the one that mattered).** `verify()` only checked the "`--lora` given but
+the file says otherwise" direction, so a **lora-built overlay verified with `--f16` and no `--lora`**
+re-derived with no delta, failed, and was reported as *"does not reproduce … so it was corrupted or
+built from other inputs"* — **accusing the file of corruption for the caller's omission**. Now the
+declared `merge_delta` is read first and the omission is named as an omission:
+
+```
+FAIL reproduction: this overlay DECLARES a merge — taillis.provenance.merge_delta =
+  lora:sha256=45541482…,config=a90e6c5b…,alpha=2,rank=4,scale=0.5,applied=2,unapplied=4,
+  dense_skipped=0,map=ffn_down_exps[w2:0:4096] — but no delta source was supplied, so the
+  reproduction below would merge NOTHING and could not match. Pass --lora ADAPTER
+  --lora-config CONFIG. This is a MISSING INPUT, not evidence that the file is corrupt
+```
+
+"Corrupted" now means exactly what it says: the declared inputs *were* supplied and still do not
+reproduce. The generic form of the class is closed too — a `sha256:`-built overlay verified without
+`--delta` gets the same treatment, naming `--delta` instead. **Related asymmetry, also fixed:**
+`--verify` silently ignored `--delta`/`--delta-synth` when `--lora` was present (the reproduction
+prefers the adapter) while `build()` refused that combination; both paths now call one
+`one_delta_source()` and refuse with build's own words.
+
+| item | what changed | where |
+|---|---|---|
+| **S1** | omission diagnosed as an omission; "corrupted" reserved for supplied-but-wrong inputs; delta-source exclusivity enforced on `--verify` too | `:2003-2043`, `one_delta_source()` `:1332`, called at `:1383` (build) and `:2009` (verify) |
+| **N2** | gates (a) and (e) predict the FULL `merge_delta` string before the build and assert **equality**; (a) also asserts the no-adapter build carries no such key | `gate_a.py:73-90`, `gate_e.py:46-54` |
+| **N3** | the adapter identity check compares `config=` as well as `sha256=` | `:2038-2045` |
+| **N4** | §7.5 corrected: an UNEQUAL fusion is caught **loudly** by the `lora_B == (ne1/2, rank)` check (`:876-880`); the real silent residual is an equal-halves ORDER swap | §7.5 |
+| **N5** | `rank < 1` is a named refusal instead of a bare `ZeroDivisionError` | `:1074-1080` |
+| **N6** | the `lora:unsupported-tensor` refusal (a stacked 3-D pair) and `rank 0` now have gate cases | `make_adapter.py:77-90`, `gate_f.py:57-60` |
+| **N7** | the code comment no longer cites the reboot-wiped `/tmp/lora-probe` path; §3 records the commit; the `lora:delta` row matches what is gated (both arms) | `:745-747`, §1, §3 |
+| **N8** | documented in §1 and sharpened in the message: a FUSED logical needs **both** halves for every expert, so a `target_modules=["gate_proj"]`-only adapter is refused with that reason rather than a remedy that cannot work | `:855-862`, §1 |
+
+Re-run after the fixes, one binary, exit codes: **gate (a) 0**, **gate (b) 0**, **gate (c) 0**,
+**gate (d) 0**, **gate (e) 0**, **gate (f) 0 (16/16 refusals)** — (b), (c) and (d) unchanged, as they
+should be: none of the fixes touches the merge arithmetic. Gate (e) grew from 13 to 19 checks,
+including the two S1 directions above.

@@ -41,8 +41,8 @@ def main():
     p.add_argument("--dense", action="store_true",
                    help="also carry dense-module pairs the overlay path cannot express")
     p.add_argument("--broken", default=None,
-                   choices=("shared", "b-out", "rank", "dup", "incomplete", "garbage",
-                            "rslora", "dora", "alpha-pattern"),
+                   choices=("shared", "b-out", "rank", "rank0", "ndim", "dup",
+                            "incomplete", "garbage", "rslora", "dora", "alpha-pattern"),
                    help="emit a DELIBERATELY refused adapter, one failure class each")
     a = p.parse_args()
 
@@ -74,6 +74,19 @@ def main():
                 base = f"{PREFIX}layers.{a.layer}.mlp.experts.{e}.{HF[pr]}"
                 for f in (".lora_A.weight", ".lora_B.weight"):
                     T[f"layers.{a.layer}.experts.{e}.w1{f}"] = T[base + f]
+    if a.broken == "ndim":
+        # a STACKED 3-D per-expert pair -- the GGUF-expressible shape a converter-minded
+        # user would hand over, and not a weight update this path can place
+        k = f"{PREFIX}layers.{a.layer}.mlp.experts.{experts[0]}.{HF[projs[0]]}.lora_A.weight"
+        T[k] = np.zeros((1, a.rank, T[k].shape[1]), dtype=np.float32)
+    if a.broken == "rank0":
+        # a (0, in) lora_A is constructible; rank 0 makes alpha/rank undefined
+        for pr in projs:
+            k = f"{PREFIX}layers.{a.layer}.mlp.experts.{experts[0]}.{HF[pr]}"
+            T[k + ".lora_A.weight"] = np.zeros((0, T[k + ".lora_A.weight"].shape[1]),
+                                               dtype=np.float32)
+            T[k + ".lora_B.weight"] = np.zeros((T[k + ".lora_B.weight"].shape[0], 0),
+                                               dtype=np.float32)
     if a.broken == "incomplete":
         del T[f"{PREFIX}layers.{a.layer}.mlp.experts.{experts[0]}.{HF[projs[0]]}.lora_B.weight"]
     if a.dense:

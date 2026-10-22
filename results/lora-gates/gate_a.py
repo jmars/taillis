@@ -70,8 +70,20 @@ for k in diff:
 C.check(diff == ["taillis.provenance.merge_delta"],
         "the ONLY KV difference is merge_delta — the honest record that an adapter was "
         "applied (a zero one)", f"{diff}")
-C.check("applied=6" in str(fb.get("taillis.provenance.merge_delta")),
-        "merge_delta says 6 pairs were applied", str(fb.get("taillis.provenance.merge_delta")))
+# N2: predict the FULL note before the build and assert STRING EQUALITY — every field
+# (both sha256s, alpha, rank, scale, the three counts and the row-block map) is known
+# before a byte is written, so a substring check would let the one uncompared key
+# smuggle arbitrary content.
+cfg_z = sw_z.parent / "adapter_config.json"
+predicted = (f"lora:sha256={C.sha256(sw_z)},config={C.sha256(cfg_z)},alpha=2,rank=4,"
+             f"scale=0.5,applied=6,unapplied=0,dense_skipped=0,"
+             f"map=ffn_down_exps[w2:0:4096];ffn_gate_up_exps[w1:0:2048,w3:2048:4096]")
+C.check(fb.get("taillis.provenance.merge_delta") == predicted,
+        "merge_delta EQUALS the string predicted before the build",
+        f"\n     predicted: {predicted}\n     got      : "
+        f"{fb.get('taillis.provenance.merge_delta')}")
+C.check("taillis.provenance.merge_delta" not in fa,
+        "the no-adapter build carries NO merge_delta at all", "")
 C.check(len(fa) == len(fb) - 1, "the zero-B file carries exactly one extra key",
         f"{len(fa)} vs {len(fb)}")
 C.finish("gate-a")
