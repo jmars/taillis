@@ -45,8 +45,13 @@ Usage
         [--imatrix-sha256 HEX] [--quant-flags STR]
     tools/repack_overlay.py --base BASE.gguf --out OVERLAY.gguf --identity \
         --override "L:LOGICAL"          # whole-tensor kind (no ids)
+    # the DIFFERENT-TYPE regime (S7): the override is produced at a type the base
+    # does not use, and NO imatrix is asked for or stamped (q5_k needs none)
+    tools/repack_overlay.py --base BASE.gguf --f16 F16.gguf --out OVERLAY.gguf \
+        --requantise --target-type Q5_K --override "L:LOGICAL:ID,ID" \
+        --llama-quantize BIN [--delta-synth SEED:RELRMS]
     tools/repack_overlay.py --verify --base BASE.gguf --overlay OVERLAY.gguf
-    tools/repack_overlay.py --show OVERLAY.gguf
+    tools/repack_overlay.py --show --overlay OVERLAY.gguf
 
     # the S1b merge path: quantised from the F16 with the BASE's own spec
     tools/repack_overlay.py --base BASE.gguf --f16 F16.gguf --out OVERLAY.gguf \
@@ -87,6 +92,24 @@ are refused too (each is a different scale), as is an unrecognised module name.
 Recognised DENSE modules (attention, router, shared experts) cannot be expressed by
 an expert-slice override at all; they are counted and DECLARED in the merge_delta
 provenance, never silently dropped.
+
+THE TARGET TYPE, AND THE IMATRIX RULE THAT FOLLOWS FROM IT (S7).  The override's
+type is the tensor's own ggml type field (layout.md V4.3 clause 5) — there is no
+second declaration and nothing to parse.  `--target-type` asks for a type; absent, the
+base segment's own type is the target (the SAME-TYPE regime, aubier's S1-S5), and a
+different value is the DIFFERENT-TYPE regime (S7), where the store must give those
+experts their own segment because a slice carries one type.  The type must be
+EXPRESSIBLE for every overridden tensor (its block size must divide ne[0]); if it is
+not, the build STOPS rather than substituting a type that is.
+
+`--imatrix` follows llama-quantize's OWN requirement line
+(`tensor_requires_imatrix`, llama-quant.cpp:856), not a policy of ours: REQUIRED for
+`IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_M, IQ1_S` and for `Q2_K` inside a `Q2_K_S` run,
+and REFUSED for every other type.  A refused imatrix is not pedantry: `q5_k` never
+reads one, so stamping `taillis.provenance.imatrix_sha256` (and an `expert_crop`) on
+such a build would be a false provenance claim — the same lie as a missing one,
+pointed the other way.  That is also what makes an S7 variant over the shipped
+`IQ2_XXS`/`IQ2_S` base buildable at all today.
 
 THE ID KEY IS PER-TENSOR, AND `k` IS GLOBALLY UNIQUE IN THE FILE.  layout.md V4.4
 (withdrew the single ARRAY key of the first draft — aubier's objection, and they
@@ -213,8 +236,9 @@ from pathlib import Path
 import numpy as np
 
 try:
-    from gguf import GGUFReader, GGUFWriter, GGUFValueType
+    from gguf import GGUFReader, GGUFWriter, GGUFValueType, GGMLQuantizationType
     from gguf.lazy import LazyChunkedTensor
+    from gguf.quants import GGML_QUANT_SIZES
 except ImportError as e:  # pragma: no cover - environment error, not logic
     sys.exit(f"FATAL: gguf-py not importable ({e}); use venvs/convert/bin/python3")
 
@@ -243,6 +267,13 @@ OVERLAY_TOOL_KEY = "taillis.provenance.overlay_tool"
 IMATRIX_KEY = "taillis.provenance.imatrix_sha256"
 QUANT_FLAGS_KEY = "taillis.provenance.quantize_flags"
 QUANT_PROV_KEYS = (IMATRIX_KEY, QUANT_FLAGS_KEY)
+# MEASURED, llama-quant.cpp:856 `tensor_requires_imatrix`: the types whose
+# quantisation NEEDS an importance matrix, and the one type that needs it only as
+# part of a Q2_K_S file.  The requirement here mirrors the quantiser's OWN line —
+# not a policy of ours — so `--imatrix` is demanded exactly where llama-quantize
+# would refuse without it, and REFUSED where it could not read it: a stamp naming
+# a matrix nothing read is the same lie as a missing one, pointed the other way.
+IMATRIX_TYPES = frozenset({"IQ3_XXS", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ1_M", "IQ1_S"})
 # §7.1 names reused verbatim by the quantised path (never invented here).
 TYPE_FILE_KEY = "taillis.provenance.type_file_sha256"
 QUANT_TOOL_KEY = "taillis.provenance.quantize_tool"
@@ -1134,6 +1165,44 @@ def lora_plan_report(ad: LoraAdapter, resolved: list) -> str:
             f"dense_skipped={len(ad.dense)},map={ad.map_note(ne1_by_logical)}")
 
 
+def type_requires_imatrix(target_type: str, ftype: str) -> bool:
+    """True iff llama-quantize needs an importance matrix for this target type.
+
+    MIRRORS THE QUANTISER'S OWN LINE (`tensor_requires_imatrix`,
+    llama-quant.cpp:856-875), not a policy invented here: `IQ3_XXS, IQ2_XXS,
+    IQ2_XS, IQ2_S, IQ1_M, IQ1_S` always, and `Q2_K` only inside a `Q2_K_S` file
+    (`ftype` is the file type, i.e. the positional ftype of the run).
+    """
+    t = target_type.upper()
+    if t in IMATRIX_TYPES:
+        return True
+    return t == "Q2_K" and ftype.upper() in ("Q2_K_S", "MOSTLY_Q2_K_S")
+
+
+def type_sizes(type_name: str) -> tuple[int, int]:
+    """(block_size, type_size) of a ggml type by NAME; a NAMED failure if unknown."""
+    try:
+        return GGML_QUANT_SIZES[GGMLQuantizationType[type_name.upper()]]
+    except KeyError:
+        raise SystemExit(f"FATAL: '{type_name}' is not a ggml type this tool knows; the "
+                         f"override's type IS the tensor's own ggml type (V4.3 clause 5), so an "
+                         f"unnameable type cannot be built or checked")
+
+
+def expert_stride(type_name: str, ne01: tuple[int, int]) -> int:
+    """Bytes per expert for a tensor of this type and shape, from the type's own
+    block size — the check that a type is EXPRESSIBLE for the tensor (V4.3
+    clause 5: any type whose block size divides ne[0])."""
+    block, size = type_sizes(type_name)
+    ne0, ne1 = ne01
+    if ne0 % block:
+        raise SystemExit(
+            f"FATAL: type {type_name} has a block size of {block} and ne[0]={ne0} is not "
+            f"divisible by it, so this type cannot express this tensor at all (layout.md §1, "
+            f"V4.3 clause 5)")
+    return (ne0 // block) * size * ne1
+
+
 def write_slice_gguf(path: Path, src_reader, tensor_name: str, rows: np.ndarray) -> None:
     """A THROWAWAY GGUF holding only the override rows, quantisable by llama-quantize.
 
@@ -1224,24 +1293,31 @@ def write_cropped_imatrix(path: Path, src_reader, tensor_name: str, ids: list[in
     w.close()
 
 
-def run_llama_quantize(binary: Path, slice_path: Path, out_path: Path, imatrix: Path,
-                       type_file: Path, quant_type: str, nthread: int,
-                       log_path: Path) -> tuple[str, str]:
-    """Quantise the slice with the base's own spec; return (flags string, tool string).
+def run_llama_quantize(binary: Path, slice_path: Path, out_path: Path, imatrix: Path | None,
+                       type_file: Path | None, quant_type: str, nthread: int,
+                       log_path: Path) -> str:
+    """Quantise the slice at `quant_type`; return the llama-quantize tool string.
 
-    A --dry-run pass runs FIRST: it parses the type file and reports the plan, so a
-    malformed spec fails in ~200 ms instead of after a real quantisation (this is
-    the check that caught a name=type vs name type error in an earlier unit).  The
-    PRODUCED type is then read back from the output file by the caller — the dry
-    run is not trusted to prove the assignment.
+    A --dry-run pass runs FIRST: it parses the spec and reports the plan, so a
+    malformed type/type-file fails in ~200 ms instead of after a real quantisation
+    (this is the check that caught a name=type vs name type error in an earlier
+    unit).  The PRODUCED type is then read back from the output file by the caller
+    — the dry run is not trusted to prove the assignment.
+
+    `imatrix` and `type_file` are OPTIONAL and their absence is not a fallback: an
+    imatrix is passed only when the target type requires one (llama-quant.cpp:856),
+    and a type file only when the caller has one.  Neither is ever synthesised.
     """
     argv0, env = quantize_runner(binary)
-    flags = (f"--imatrix {imatrix} --tensor-type-file {type_file} {quant_type} {nthread}")
+    base_cmd = [argv0]
+    if imatrix is not None:
+        base_cmd += ["--imatrix", str(imatrix)]
+    if type_file is not None:
+        base_cmd += ["--tensor-type-file", str(type_file)]
     with open(log_path, "wb") as log:
         for extra in (["--dry-run"], []):
-            cmd = [argv0] + extra + ["--imatrix", str(imatrix), "--tensor-type-file",
-                                          str(type_file), str(slice_path), str(out_path),
-                                          quant_type, str(nthread)]
+            cmd = [argv0] + extra + base_cmd[1:] + [str(slice_path), str(out_path),
+                                                   quant_type, str(nthread)]
             r = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
             log.flush()
             if r.returncode != 0:
@@ -1256,16 +1332,21 @@ def run_llama_quantize(binary: Path, slice_path: Path, out_path: Path, imatrix: 
         if m:
             tool = f"llama-quantize@{m.group(1)}"
             break
-    return flags, tool
+    return tool
 
 
 def read_quantised(path: Path, want_type: str, want_nbytes: int, what: str):
-    """(bytes, numpy shape) of the quantised slice, with the type CHECKED.
+    """(bytes, numpy shape, ggml type) of the quantised slice, with the type CHECKED.
 
-    A produced type that is not the base segment's is a NAMED FAILURE and not a
-    warning: it means the base's type file did not match the slice, and an overlay
-    of the wrong type is refused at load by V4.3 clause 5 — or worse, by a stride
-    CHECK at the first rotation far too late (expert-swap.md §5.3).
+    A produced type that is not the REQUESTED one is a NAMED FAILURE and not a
+    warning: it means the quantiser's spec did not match this slice, and an overlay
+    of an unexpected type is refused at load by V4.3 clause 5 — or worse, by a
+    stride CHECK at the first rotation far too late (expert-swap.md §5.3).
+
+    `want_type` is the target type the build asked for, which on the SAME-TYPE
+    regime is the base segment's own type and on the DIFFERENT-TYPE regime (S7)
+    deliberately is not: the type is the tensor's own ggml type either way, and
+    nothing about the encoding changes (V4.3 clause 5).
     """
     r = open_gguf(path, "quantised slice")
     if len(r.tensors) != 1:
@@ -1274,27 +1355,42 @@ def read_quantised(path: Path, want_type: str, want_nbytes: int, what: str):
     t = r.tensors[0]
     if t.tensor_type.name != want_type:
         raise SystemExit(
-            f"FATAL: {what}: the quantiser produced {t.tensor_type.name} but the base segment is "
-            f"{want_type} — §5.3's 'SAME quant spec' did NOT hold (the base's type file did not "
-            f"match this slice's tensor name), so these bytes are not the base's type")
+            f"FATAL: {what}: the quantiser produced {t.tensor_type.name} but {want_type} was "
+            f"requested — the spec handed to llama-quantize did NOT hold for this slice (its "
+            f"tensor name did not match the type file, or the positional ftype was not the "
+            f"target), so these bytes are not the type the overlay would declare")
     if t.data.nbytes != want_nbytes:
         raise SystemExit(f"FATAL: {what}: quantised nbytes {t.data.nbytes} != "
-                         f"{want_nbytes} (base stride * experts)")
-    return np.ascontiguousarray(t.data), tuple(int(x) for x in t.data.shape)
+                         f"{want_nbytes} (type stride * experts)")
+    return np.ascontiguousarray(t.data), tuple(int(x) for x in t.data.shape), t.tensor_type
 
 
 def requantised_payload(*, base_name: str, layer: int, logical: str, ids: list[int],
-                        seg, f16_reader, imatrix_reader, imatrix: Path, type_file: Path,
-                        quant_type: str,
+                        seg, f16_reader, imatrix_reader, imatrix: Path | None,
+                        type_file: Path | None,
+                        quant_type: str | None = None, target_type: str | None = None,
                         nthread: int, quantize_bin: Path, workdir: Path,
                         delta_path: Path | None, delta_synth: str | None,
                         ov_name: str, lora=None, lora_note: str = "") -> dict:
-    """cut the F16 rows -> merge the delta at F16 -> re-quantise with the base's spec.
+    """cut the F16 rows -> merge the delta at F16 -> re-quantise at the target type.
 
     ONE implementation, used by BUILD and by --verify's reproduction mode, so the
     gate and the writer cannot drift apart.
+
+    `target_type` is the type the override must be produced at: the base segment's
+    own type on the SAME-TYPE regime (the default, and aubier's S1-S5), or a
+    DIFFERENT type on S7's regime.  `imatrix_reader`/`imatrix` are None whenever
+    the target type does not require one (llama-quant.cpp:856), and then NO crop is
+    written and none is declared: nothing was imatrix-weighted, so naming a matrix
+    would be a false provenance claim.
     """
     what = f"{ov_name} ({base_name})"
+    target = (target_type or seg.tensor.tensor_type.name).upper()
+    # The POSITIONAL ftype handed to llama-quantize: the caller's --quant-type when
+    # given, else the target itself.  It is also the `ftype` llama-quantize judges
+    # `Q2_K` against (`tensor_requires_imatrix`'s Q2_K_S case), so it is recorded in
+    # the flags and re-derived by --verify — never guessed.
+    positional = (quant_type or target).upper()
     src = f16_tensor_for(f16_reader, layer, logical, seg.ne01)
     rows = cut_rows(src, ids, what)
     # element dims, NOT seg.tail: for a QUANTISED base segment, tensor.data.shape is
@@ -1315,28 +1411,38 @@ def requantised_payload(*, base_name: str, layer: int, logical: str, ids: list[i
     workdir.mkdir(parents=True, exist_ok=True)
     tag = re.sub(r"[^A-Za-z0-9_.-]", "_", ov_name)
     slice_path = workdir / f"{tag}.f16.gguf"
-    quant_path = workdir / f"{tag}.{quant_type.lower()}.gguf"
+    quant_path = workdir / f"{tag}.{positional.lower()}.gguf"
     for p in (slice_path, quant_path):
         if p.exists():
             p.unlink()                      # our own throwaway, never a base
     write_slice_gguf(slice_path, f16_reader, f"blk.{layer}.{logical}.weight", merged)
-    crop_path = workdir / f"{tag}.imatrix.gguf"
-    if crop_path.exists():
-        crop_path.unlink()
-    write_cropped_imatrix(crop_path, imatrix_reader, f"blk.{layer}.{logical}.weight", ids,
-                          seg.ne01[0])
-    flags, tool = run_llama_quantize(quantize_bin, slice_path, quant_path, crop_path, type_file,
-                                     quant_type, nthread, workdir / f"{tag}.quantize.log")
+    crop_path = None
+    if imatrix_reader is not None:
+        crop_path = workdir / f"{tag}.imatrix.gguf"
+        if crop_path.exists():
+            crop_path.unlink()
+        write_cropped_imatrix(crop_path, imatrix_reader, f"blk.{layer}.{logical}.weight", ids,
+                              seg.ne01[0])
+    tool = run_llama_quantize(quantize_bin, slice_path, quant_path, crop_path, type_file,
+                              positional, nthread, workdir / f"{tag}.quantize.log")
     # The stamped spec names the BASE matrix, not the throwaway crop: the crop is a
     # deterministic function of (that matrix, these ids), so it is reproducible
     # from the declaration, while a /tmp path would not be.  `--expert-crop` is OUR
     # clause, not a llama-quantize flag — llama-quantize has none, and cannot have
-    # one, because the crop is what makes its length check pass.
-    flags = (f"--imatrix {imatrix} --expert-crop {','.join(str(e) for e in ids)} "
-             f"--tensor-type-file {type_file} {quant_type} {nthread}")
-    payload, out_shape = read_quantised(quant_path, seg.tensor.tensor_type.name,
-                                       seg.stride * len(ids), what)
-    return {"payload": payload, "shape": out_shape, "flags": flags, "tool": tool,
+    # one, because the crop is what makes its length check pass.  With no imatrix in
+    # hand neither clause is stamped, because neither is true.
+    parts: list[str] = []
+    if imatrix is not None:
+        parts += ["--imatrix", str(imatrix), "--expert-crop", ",".join(str(e) for e in ids)]
+    if type_file is not None:
+        parts += ["--tensor-type-file", str(type_file)]
+    parts += [positional, str(nthread)]
+    flags = " ".join(parts)
+    same_type = target == seg.tensor.tensor_type.name.upper()
+    want_nbytes = (seg.stride if same_type else expert_stride(target, seg.ne01)) * len(ids)
+    payload, out_shape, out_type = read_quantised(quant_path, target, want_nbytes, what)
+    return {"payload": payload, "shape": out_shape, "type": out_type, "flags": flags,
+            "tool": tool, "target": target, "same_type": same_type,
             "delta_note": delta_note, "merge": merge_info, "slice": slice_path,
             "quantised": quant_path}
 
@@ -1363,10 +1469,11 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
           imatrix: str | None, quant_flags: str | None,
           f16: Path | None = None, requantise: bool = False,
           imatrix_path: Path | None = None, type_file: Path | None = None,
-          quant_type: str = "IQ2_XXS", nthread: int = 8,
+          quant_type: str | None = None, nthread: int = 8,
           quantize_bin: Path | None = None, workdir: Path | None = None,
           delta_synth: str | None = None, input_sha: str | None = None,
-          lora: Path | None = None, lora_config: Path | None = None) -> int:
+          lora: Path | None = None, lora_config: Path | None = None,
+          target_type: str | None = None) -> int:
     real = need(base, "--base")
     out = out.resolve()
     check_write_scope(out)
@@ -1382,20 +1489,23 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
                          "declare which one produced it")
     one_delta_source(lora, delta, delta_synth)
     if requantise:
-        missing = [n for n, v in (("--f16", f16), ("--imatrix", imatrix_path),
-                                 ("--type-file", type_file), ("--llama-quantize",
-                                                              quantize_bin)) if v is None]
+        missing = [n for n, v in (("--f16", f16), ("--llama-quantize", quantize_bin)) if v is None]
         if missing:
             raise SystemExit(
-                f"FATAL: --requantise needs {', '.join(missing)} — §5.3's rule is 're-quantise "
-                f"with the SAME imatrix and the SAME quant spec', so the base's own imatrix and "
-                f"type file are INPUTS and cannot be defaulted, and the >=16-bit source is the "
-                f"only place the merge may happen")
+                f"FATAL: --requantise needs {', '.join(missing)} — the >=16-bit source is the "
+                f"only place the merge may happen, and the quantiser is what makes the payload. "
+                f"(--imatrix and --type-file are decided against the TARGET type below: "
+                f"llama-quantize requires an imatrix only for "
+                f"{', '.join(sorted(IMATRIX_TYPES))} and for Q2_K inside a Q2_K_S file, so "
+                f"demanding one unconditionally demands a file the quantiser may not read)")
         if quant_flags is not None or imatrix is not None:
             raise SystemExit(
                 "FATAL: --quant-flags / --imatrix-sha256 are hand-written CLAIMS. On the "
                 "--requantise path both are DERIVED from the files actually used, so declaring "
                 "them is a second thing that can disagree with the first (V4.4)")
+        if target_type is not None:
+            target_type = target_type.upper()
+            type_sizes(target_type)          # named failure if it is not a ggml type
     else:
         if delta is not None or delta_synth is not None or lora is not None:
             raise SystemExit("FATAL: a delta is merged into a QUANTISED payload; it has no "
@@ -1405,6 +1515,10 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
             raise SystemExit("FATAL: --f16 / --imatrix / --type-file belong to --requantise; an "
                              "identity overlay reproduces the base's own bytes and quantises "
                              "nothing")
+        if target_type is not None:
+            raise SystemExit("FATAL: --target-type belongs to --requantise; an identity overlay "
+                             "copies the base's own bytes at the base's own type, so asking for a "
+                             "different one is a contradiction (V4.3 clause 5)")
     if not raw_overrides:
         raise SystemExit("FATAL: give at least one --override "
                          "'L:LOGICAL:ID,ID' (expert-slice) or 'L:LOGICAL' (whole-tensor)")
@@ -1453,6 +1567,54 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
                 f"so §5.3 has nothing to say about it. Use --identity for those tensors and a "
                 f"separate overlay for the quantised experts")
 
+    # THE TARGET TYPE and the IMATRIX DECISION, both resolved per override BEFORE
+    # the base is hashed and before anything is written.
+    #
+    # The target type is the base segment's OWN type (the SAME-TYPE regime, aubier's
+    # S1-S5) unless --target-type asks for a DIFFERENT one (S7).  Expressibility is
+    # checked here and FAILS LOUDLY: a type whose block size does not divide ne[0]
+    # cannot express the tensor at all (layout.md §1, V4.3 clause 5), and
+    # substituting a type that can would be a silent lie about what the overlay is.
+    targets: dict[int, str] = {}
+    imatrix_needed = False
+    if requantise:
+        for k, layer, logical, ids, kind, obj in resolved:
+            t = (target_type or obj.tensor.tensor_type.name).upper()
+            try:
+                expert_stride(t, obj.ne01)
+            except SystemExit as e:
+                raise SystemExit(f"{e}\n  (override blk.{layer}.{logical}.ov{k}: "
+                                 f"ne={obj.ne01 + (len(ids),)}; STOPPING rather than "
+                                 f"substituting a type — V4.3 clause 5 makes the tensor's "
+                                 f"own type the whole declaration)")
+            targets[k] = t
+        # `ftype` in llama-quantize's check is the POSITIONAL of the run, which is
+        # --quant-type when given and the target otherwise (requantised_payload builds
+        # the same value) — so a Q2_K target is judged as a Q2_K run, and only a
+        # Q2_K_S positional makes it imatrix-requiring, exactly as the quantiser does.
+        def _positional(t: str) -> str:
+            return (quant_type or t).upper()
+
+        needs_im = sorted({t for t in targets.values()
+                           if type_requires_imatrix(t, _positional(t))})
+        cannot = sorted({t for t in targets.values()
+                         if not type_requires_imatrix(t, _positional(t))})
+        if needs_im and imatrix_path is None:
+            raise SystemExit(
+                f"FATAL: target type(s) {', '.join(needs_im)} REQUIRE an importance matrix "
+                f"(llama-quant.cpp:856 tensor_requires_imatrix) and no --imatrix was given. "
+                f"llama-quantize refuses these types without one, and quantising them without "
+                f"it is what the quantiser's own gate exists to stop")
+        if imatrix_path is not None and not needs_im:
+            raise SystemExit(
+                f"FATAL: --imatrix was given but the target type(s) {', '.join(cannot)} cannot "
+                f"use one — llama-quantize requires an importance matrix only for "
+                f"{', '.join(sorted(IMATRIX_TYPES))} and for Q2_K inside a Q2_K_S file "
+                f"(llama-quant.cpp:856). Stamping an imatrix sha256 (and a crop) on a build "
+                f"that never read it is a FALSE PROVENANCE claim — the same lie as a missing "
+                f"one, pointed the other way — so it is refused, not warned about")
+        imatrix_needed = bool(needs_im)
+
     # The ADAPTER is read and CROSS-CHECKED against the whole override plan BEFORE the
     # base is hashed and before anything is written: an adapter whose shapes disagree
     # with the base, whose pairs miss a declared expert, or that cannot be placed at
@@ -1484,29 +1646,40 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
     f16_reader = None
     if requantise:
         f16_reader = open_gguf(need(f16, "--f16"), "F16 source")
-        imatrix_path = need(imatrix_path, "--imatrix")
-        type_file = need(type_file, "--type-file")
-        print(f"imatrix chk : {check_imatrix_against_base(reader, imatrix_path)}")
-        imatrix_reader = open_gguf(imatrix_path, "imatrix")
+        imatrix_path = need(imatrix_path, "--imatrix") if imatrix_needed else None
+        type_file = need(type_file, "--type-file") if type_file is not None else None
+        imatrix_reader = None
+        if imatrix_path is not None:
+            print(f"imatrix chk : {check_imatrix_against_base(reader, imatrix_path)}")
+            imatrix_reader = open_gguf(imatrix_path, "imatrix")
         if input_sha is None:
             input_sha = sha256_file(need(f16, "--f16"))
         else:
             print(f"input sha   : {input_sha} SUPPLIED with --input-sha256, not recomputed — "
                   f"hashing a 222 GiB source costs ~5 min per build; the value is the caller's "
                   f"measurement and any reader can re-derive it with sha256sum")
-        quant_prov = {
-            IMATRIX_KEY: sha256_file(imatrix_path),
-            TYPE_FILE_KEY: sha256_file(type_file),
-            INPUT_KEY: input_sha,
-        }
+        quant_prov = {INPUT_KEY: input_sha}
+        if imatrix_path is not None:
+            quant_prov[IMATRIX_KEY] = sha256_file(imatrix_path)
+        else:
+            print(f"imatrix     : ABSENT BY RULE — no target type needs one "
+                  f"(llama-quant.cpp:856), so {IMATRIX_KEY} and {EXPERT_CROP_KEY} are NOT "
+                  f"stamped: nothing was imatrix-weighted and claiming otherwise would be "
+                  f"false provenance")
+        if type_file is not None:
+            quant_prov[TYPE_FILE_KEY] = sha256_file(type_file)
         wd = workdir if workdir is not None else Path("/tmp") / f"repack-overlay-{os.getpid()}"
         check_write_scope((wd / "probe").resolve())
         for k, layer, logical, ids, kind, obj in resolved:
+            pos = (quant_type or targets[k]).upper()
+            uses_imatrix = type_requires_imatrix(targets[k], pos)
             rp = requantised_payload(
                 base_name=real.name, layer=layer, logical=logical, ids=ids, seg=obj,
-                f16_reader=f16_reader, imatrix_reader=imatrix_reader,
-                imatrix=imatrix_path, type_file=type_file,
-                quant_type=quant_type, nthread=nthread, quantize_bin=quantize_bin, workdir=wd,
+                f16_reader=f16_reader,
+                imatrix_reader=(imatrix_reader if uses_imatrix else None),
+                imatrix=(imatrix_path if uses_imatrix else None), type_file=type_file,
+                quant_type=pos, target_type=targets[k], nthread=nthread,
+                quantize_bin=quantize_bin, workdir=wd,
                 delta_path=delta, delta_synth=delta_synth,
                 ov_name=f"blk.{layer}.{logical}.ov{k}.weight",
                 lora=lora_ad, lora_note=lora_note)
@@ -1531,6 +1704,18 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
         fd_cmp = os.open(real, os.O_RDONLY)
         try:
             for k, layer, logical, ids, kind, seg in resolved:
+                if targets[k] != seg.tensor.tensor_type.name.upper():
+                    # DIFFERENT-TYPE regime (S7): the payload has a different number
+                    # of bytes per expert than the base slab, so it cannot equal it —
+                    # the flag is false by construction, and the byte comparison that
+                    # would prove it is not even defined here.
+                    derived_identity = False
+                    print(f"base cmp    : blk.{layer}.{logical}.ov{k} -> not comparable "
+                          f"(overlay {targets[k]} vs base {seg.tensor.tensor_type.name}): the "
+                          f"payload is {expert_stride(targets[k], seg.ne01) * len(ids)} byte(s) "
+                          f"where the base slab set is {seg.stride * len(ids)} — DIFFERENT-TYPE "
+                          f"by construction, so {OVERLAY_IDENTITY_KEY} is not stamped")
+                    continue
                 act = payloads[k]["payload"].reshape(-1)
                 per = []
                 for j, e in enumerate(ids):
@@ -1559,9 +1744,15 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
                 entry = ",".join(str(e) for e in ids)
                 if requantise:
                     rp = payloads[k]
-                    writer.add_tensor(name, rp["payload"],
-                                      raw_dtype=seg.tensor.tensor_type)
-                    mode = "REQUANTISED from F16"
+                    # The tensor's OWN ggml type IS the declaration (V4.3 clause 5) —
+                    # on the different-type regime that is deliberately not the base
+                    # segment's type, and the tensor is written at the type the
+                    # quantiser produced (read back, checked, never assumed).
+                    writer.add_tensor(name, rp["payload"], raw_dtype=rp["type"])
+                    mode = (f"REQUANTISED from F16 at {rp['target']}"
+                            + ("" if rp["same_type"] else
+                               f" (DIFFERENT from the base segment's "
+                               f"{seg.tensor.tensor_type.name})"))
                 else:
                     chunks: list = []
                     for e in ids:
@@ -1583,18 +1774,23 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
                 writer.add_key_value(f"{OVERLAY_DIGEST_PREFIX}{k}", dig, GGUFValueType.STRING)
                 digests[k] = dig
                 if requantise:
-                    # An imatrix was actually cropped only on this path; a verbatim
-                    # identity cut quantises nothing, so it declares no crop.
-                    crops.append(f"ov{k}={entry}")
-                n_bytes += len(ids) * seg.stride
+                    # An imatrix was actually cropped only on this path AND only when
+                    # the target type requires one; a q5_k build reads no matrix, so it
+                    # declares no crop (V4.4's pair is a claim about bytes that were
+                    # actually weighted).
+                    if "--expert-crop" in payloads[k]["flags"]:
+                        crops.append(f"ov{k}={entry}")
+                n_bytes += (payloads[k]["payload"].nbytes if requantise
+                            else len(ids) * seg.stride)
                 print(f"override {k}  : {name}  ne={seg.ne01 + (len(ids),)}  "
-                      f"type={seg.tensor.tensor_type.name}  [{KIND_SLICE}, {mode}]")
+                      f"type={payloads[k]['target'] if requantise else seg.tensor.tensor_type.name}"
+                      f"  [{KIND_SLICE}, {mode}]")
                 print(f"  base seg : {seg.name}  [{seg.lo},{seg.hi})  "
                       f"data_offset={seg.off}  stride={seg.stride} "
                       f"({seg.stride * len(ids)} bytes for {len(ids)} expert(s))")
                 print(f"  id key   : {OVERLAY_EXPERTS_PREFIX}{k} = \"{entry}\"")
                 print(f"  digest   : {OVERLAY_DIGEST_PREFIX}{k} = {dig}  "
-                      f"(sha256 of the {seg.stride * len(ids)} payload byte(s))")
+                      f"(sha256 of the {payloads[k]['payload'].nbytes if requantise else seg.stride * len(ids)} payload byte(s))")
                 if requantise:
                     mi = payloads[k]["merge"]
                     print(f"  merge    : delta={payloads[k]['delta_note'] or 'NONE'}  "
@@ -1655,8 +1851,8 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
     if requantise:
         ident = ("= true (DERIVED: every requantised payload was compared with its base slab "
                  "and equals it byte for byte)" if derived_identity else
-                 "ABSENT (DERIVED: at least one requantised payload differs from its base — a "
-                 "delta was merged)")
+                 "ABSENT (DERIVED: the payloads differ from their base — a delta was merged, or "
+                 "the target type is not the base segment's)")
         print(f"identity    : {OVERLAY_IDENTITY_KEY} {ident}")
     else:
         print(f"identity    : True (taillis.overlay_identity; every payload is a VERBATIM cut)")
@@ -1697,8 +1893,9 @@ def build(base: Path, out: Path, raw_overrides: list[str], identity: bool,
             item = {
                 "tensor": f"blk.{layer}.{logical}.ov{k}.weight",
                 "layer": layer, "logical": logical, "k": k, "kind": kind,
-                "type": obj.tensor.tensor_type.name if kind == KIND_SLICE
-                        else obj.tensor_type.name,
+                "type": (targets.get(k) if requantise else None)
+                        or (obj.tensor.tensor_type.name if kind == KIND_SLICE
+                            else obj.tensor_type.name),
             }
             if kind == KIND_SLICE:
                 item.update({"experts": ids, "group": obj.name,
@@ -1965,21 +2162,57 @@ def verify(base: Path, overlay: Path, f16: Path | None = None, imatrix_path: Pat
     repro = f16 is not None
     f16_reader = None
     rd_wd = None
+    # The declared spec's ftype is read here, once, because BOTH the reproduction
+    # inputs and the imatrix-provenance gate below are decided by the file's own
+    # types against llama-quantize's own requirement line (llama-quant.cpp:856).
+    declared_flags = (str(b.fields[QUANT_FLAGS_KEY].contents())
+                      if QUANT_FLAGS_KEY in b.fields else "")
+    flag_toks = declared_flags.split()
+    ftype = quant_type or (flag_toks[-2] if len(flag_toks) >= 2 else "IQ2_XXS")
     if repro:
-        if imatrix_path is None or type_file is None or quantize_bin is None:
+        # WHICH INPUTS THE REPRODUCTION NEEDS IS DECIDED BY THE FILE'S OWN TYPES, not
+        # by a fixed list: an imatrix is required exactly when a declared type
+        # requires one (llama-quant.cpp:856), and a type file exactly when the file
+        # declares one.  A q5_k overlay was built with neither, so demanding them
+        # would make the only content gate unrunnable on it.
+        needs_im = sorted({t.tensor_type.name for t in ov_tensors
+                           if type_requires_imatrix(t.tensor_type.name, ftype)})
+        no_im = sorted({t.tensor_type.name for t in ov_tensors
+                        if not type_requires_imatrix(t.tensor_type.name, ftype)})
+        if imatrix_path is not None and not needs_im:
             raise SystemExit(
-                "FATAL: --f16 asks for the REPRODUCTION gate, which needs --imatrix, "
-                "--type-file and --llama-quantize — the payload is reproduced by re-running "
-                "the quantiser with the spec the file declares, and nothing is trusted")
+                f"FATAL: --imatrix was given but this overlay's type(s) {', '.join(no_im) or '?'} "
+                f"cannot use one — llama-quantize requires an importance matrix only for "
+                f"{', '.join(sorted(IMATRIX_TYPES))} and for Q2_K inside a Q2_K_S file "
+                f"(llama-quant.cpp:856). Passing one here would be reproducing with an input "
+                f"the build never read")
+        missing = [n for n, v in (("--llama-quantize", quantize_bin),) if v is None]
+        if needs_im and imatrix_path is None:
+            missing.append("--imatrix")
+        if TYPE_FILE_KEY in b.fields and type_file is None:
+            missing.append("--type-file")
+        if missing:
+            raise SystemExit(
+                f"FATAL: --f16 asks for the REPRODUCTION gate, which needs "
+                f"{', '.join(missing)} here — the payload is reproduced by re-running the "
+                f"quantiser with the spec the file declares, and nothing is trusted "
+                f"(this overlay's type(s) {', '.join(needs_im) or 'need no imatrix'} decide "
+                f"whether an imatrix is an input at all)")
         f16_reader = open_gguf(need(f16, "--f16"), "F16 source")
-        imatrix_path = need(imatrix_path, "--imatrix")
-        type_file = need(type_file, "--type-file")
-        imatrix_reader = open_gguf(imatrix_path, "imatrix")
+        imatrix_reader = None
+        if needs_im:
+            imatrix_path = need(imatrix_path, "--imatrix")
+            imatrix_reader = open_gguf(imatrix_path, "imatrix")
+        if type_file is not None:
+            type_file = need(type_file, "--type-file")
         rd_wd = workdir if workdir is not None else Path("/tmp") / f"verify-overlay-{os.getpid()}"
         check_write_scope((rd_wd / "probe").resolve())
         declared = {k: (str(b.fields[k].contents()) if k in b.fields else None)
                     for k in (IMATRIX_KEY, TYPE_FILE_KEY, QUANT_FLAGS_KEY)}
-        for key, path in ((IMATRIX_KEY, imatrix_path), (TYPE_FILE_KEY, type_file)):
+        held = [(IMATRIX_KEY, imatrix_path)] if needs_im else []
+        if type_file is not None:
+            held.append((TYPE_FILE_KEY, type_file))
+        for key, path in held:
             if declared[key] is None:
                 errors.append(f"reproduction: {key} is ABSENT from the overlay, so the spec "
                               f"that made these bytes is not declared and cannot be reproduced")
@@ -1989,14 +2222,16 @@ def verify(base: Path, overlay: Path, f16: Path | None = None, imatrix_path: Pat
                               f"declared {key} {declared[key]} — these are not the inputs that "
                               f"built this overlay")
                 repro = False
-        flags = (declared[QUANT_FLAGS_KEY] or "").split()
         if quant_type is None:
-            quant_type = flags[-2] if len(flags) >= 2 else "IQ2_XXS"
-            if len(flags) >= 1 and flags[-1].isdigit():
-                nthread = int(flags[-1])
+            if len(flag_toks) >= 2:
+                quant_type = flag_toks[-2]
+            if len(flag_toks) >= 1 and flag_toks[-1].isdigit():
+                nthread = int(flag_toks[-1])
+        im_note = (imatrix_path.name if imatrix_path is not None else
+                   f"NONE REQUIRED for {', '.join(no_im)} (llama-quant.cpp:856)")
         print(f"reproduce   : declared spec '{declared[QUANT_FLAGS_KEY]}' -> --imatrix "
-              f"{imatrix_path.name}, --tensor-type-file {type_file.name}, {quant_type}, "
-              f"nthread {nthread}")
+              f"{im_note}, --tensor-type-file "
+              f"{type_file.name if type_file else 'NONE'}, {quant_type}, nthread {nthread}")
 
     # ---- the ADAPTER for the reproduction, if this overlay was built from one ------
     # TWO DIRECTIONS, and the MISSING-INPUT one is the one that used to accuse an
@@ -2062,6 +2297,7 @@ def verify(base: Path, overlay: Path, f16: Path | None = None, imatrix_path: Pat
     n_whole = 0
     n_dig_ok = 0
     n_experts = 0
+    n_diff_type = 0
     all_equal = True
     seg_cache: dict[tuple[int, str], list[Segment]] = {}
     try:
@@ -2114,15 +2350,35 @@ def verify(base: Path, overlay: Path, f16: Path | None = None, imatrix_path: Pat
                     errors.append(f"{name}: ne[0..1]={(ne[0], ne[1])} != base segment {seg.name} "
                                   f"{seg.ne01}")
                     continue
-                if t.tensor_type != seg.tensor.tensor_type:
-                    errors.append(f"{name}: type {t.tensor_type.name} != base segment {seg.name} "
-                                  f"type {seg.tensor.tensor_type.name} (V4.3 clause 5)")
-                    continue
-                stride = seg.stride
-                if t.data.nbytes != stride * len(ids):
-                    errors.append(f"{name}: nbytes {t.data.nbytes} != {stride} * {len(ids)} "
-                                  f"(base stride * declared experts)")
-                    continue
+                # ---- WHICH REGIME IS THIS: same-type or different-type ---------
+                # V4.3 clause 5: the tensor's own ggml type IS the type, and there are
+                # exactly two regimes.  SAME-TYPE (aubier's S1-S5) is a source-pointer
+                # swap, so a type mismatch there is a NAMED FAILURE.  DIFFERENT-TYPE
+                # (S7) is the point of the file: the store must give these experts
+                # their own SEGMENT, because a slice carries one type.  The regime is
+                # READ off the file, never declared by a second key.
+                same_type = t.tensor_type == seg.tensor.tensor_type
+                if same_type:
+                    stride = seg.stride
+                    if t.data.nbytes != stride * len(ids):
+                        errors.append(f"{name}: nbytes {t.data.nbytes} != {stride} * {len(ids)} "
+                                      f"(base stride * declared experts)")
+                        continue
+                else:
+                    try:
+                        stride = expert_stride(t.tensor_type.name, seg.ne01)
+                    except SystemExit as e:
+                        errors.append(f"{name}: {str(e).removeprefix('FATAL: ')}")
+                        continue
+                    n_diff_type += 1
+                    print(f"  type      : DIFFERENT-TYPE regime (V4.3 clause 5) — override "
+                          f"{t.tensor_type.name} vs base segment {seg.name} "
+                          f"{seg.tensor.tensor_type.name}; a slice carries ONE type, so the "
+                          f"engine must give these experts their own segment")
+                    if t.data.nbytes != stride * len(ids):
+                        errors.append(f"{name}: nbytes {t.data.nbytes} != {stride} * {len(ids)} "
+                                      f"({t.tensor_type.name} stride * declared experts)")
+                        continue
                 # ---- THE PAYLOAD DIGEST (V4.4): the content check ----------
                 got_dig = digest_ranges(fd_b, [(t.data_offset, t.data.nbytes)])
                 want_dig = digs.get(k)
@@ -2147,7 +2403,17 @@ def verify(base: Path, overlay: Path, f16: Path | None = None, imatrix_path: Pat
                 # supposed to differ (that is what a variant IS), so a difference is
                 # counted and named, and the gate is G8.3's direction (below) plus
                 # --f16's reproduction, not byte equality.
-                for j, e in enumerate(ids):
+                if not same_type:
+                    # No byte comparison EXISTS across two types: the payload holds a
+                    # different number of bytes per expert.  The digest above is the
+                    # content check, and the reproduction below is the stronger one.
+                    all_equal = False
+                    print(f"  base cmp  : NOT COMPARABLE — {t.tensor_type.name} payload "
+                          f"({stride} B/expert) vs {seg.tensor.tensor_type.name} base slab "
+                          f"({seg.stride} B/expert); a cross-type byte comparison is not "
+                          f"defined. The payload digest is the content check here, and "
+                          f"--f16 the reproduction")
+                for j, e in enumerate(ids if same_type else []):
                     d, first = compare(fd_a, seg.slab_offset(e), fd_b,
                                        t.data_offset + j * stride, stride)
                     n_bytes_cmp += stride
@@ -2165,14 +2431,20 @@ def verify(base: Path, overlay: Path, f16: Path | None = None, imatrix_path: Pat
                             print(f"  base diff : {msg}")
                     else:
                         n_ok_units += 1
-                if t_diffs == 0:
+                # A tensor that was NOT compared is not "byte-identical": on the
+                # different-type regime nothing was compared at all, and a summary
+                # that counts it as equal would say the opposite of the truth.
+                if not same_type:
+                    all_equal = False
+                elif t_diffs == 0:
                     n_tensors_ok += 1
                 else:
                     all_equal = False
                 print(f"expert band : {name}  {OVERLAY_EXPERTS_PREFIX}{k}=\"{entry}\"  "
                       f"type={t.tensor_type.name}  base seg={seg.name} [{seg.lo},{seg.hi})  "
-                      f"stride={stride}  diffs={t_diffs} bytes in {n_diff_units}/{len(ids)} "
-                      f"expert(s)")
+                      f"stride={stride}  "
+                      + (f"diffs={t_diffs} bytes in {n_diff_units}/{len(ids)} expert(s)"
+                         if same_type else f"diffs=n/a (different-type, {len(ids)} expert(s))"))
 
                 # ---- REPRODUCTION: re-derive the payload and compare it -----
                 if repro:
@@ -2180,7 +2452,8 @@ def verify(base: Path, overlay: Path, f16: Path | None = None, imatrix_path: Pat
                         base_name=real.name, layer=layer, logical=logical, ids=ids, seg=seg,
                         f16_reader=f16_reader, imatrix_reader=imatrix_reader,
                         imatrix=imatrix_path, type_file=type_file,
-                        quant_type=quant_type or "IQ2_XXS", nthread=nthread,
+                        quant_type=quant_type, target_type=t.tensor_type.name,
+                        nthread=nthread,
                         quantize_bin=quantize_bin, workdir=rd_wd, delta_path=delta,
                         delta_synth=delta_synth, ov_name=name, lora=lora_ad,
                         lora_note=(f"lora:sha256={lora_ad.sha},rank={lora_ad.rank},"
@@ -2275,7 +2548,11 @@ def verify(base: Path, overlay: Path, f16: Path | None = None, imatrix_path: Pat
                     print(f"G3          : {PARENT_KEY} == sha256(base) = {want}")
 
         # ---- G8.3: both directions --------------------------------------
-        complete = n_cmp_units > 0 and n_ok_units == n_cmp_units
+        # `complete` means EVERY override was compared AND found equal.  A
+        # different-type tensor is never compared (no cross-type byte comparison
+        # exists), so a file containing one can never be "complete" — it cannot be an
+        # identity overlay, which is exactly right.
+        complete = n_cmp_units > 0 and n_ok_units == n_cmp_units and n_diff_type == 0
         if complete and not declared_identity:
             errors.append(f"G8.3: every override payload EQUALS its base but "
                           f"{OVERLAY_IDENTITY_KEY} is absent/false — an identity overlay is "
@@ -2291,13 +2568,33 @@ def verify(base: Path, overlay: Path, f16: Path | None = None, imatrix_path: Pat
         # MS4-overlay-L20-e8-requant.gguf is both: re-quantising the base's F16
         # slice at the base's own type returns the base's bytes exactly, and a
         # quantiser really ran.  So only the non-identity case is gated.
+        #
+        # THE IMATRIX HALF IS GATED BY THE TYPE, NOT BY THE FLAG: llama-quantize needs
+        # a matrix only for IMATRIX_TYPES (and Q2_K in a Q2_K_S file), so a q5_k
+        # overlay MUST NOT carry taillis.provenance.imatrix_sha256 or a crop — naming
+        # a matrix nothing read is false provenance, the same lie as a missing one
+        # pointed the other way.  Both directions are errors here.
+        file_types = {t.tensor_type.name for t in ov_tensors}
+        needs_im_any = sorted(t for t in file_types if type_requires_imatrix(t, ftype))
         if not declared_identity:
-            for key in QUANT_PROV_KEYS:
-                if key not in b.fields:
-                    errors.append(f"{key} absent — V4.4 makes the quantisation provenance "
-                                  f"MANDATORY on an overlay that is not an identity cut (a "
-                                  f"variant's quality must not be confounded with a "
-                                  f"requantisation)")
+            if QUANT_FLAGS_KEY not in b.fields:
+                errors.append(f"{QUANT_FLAGS_KEY} absent — V4.4 makes the quantisation provenance "
+                              f"MANDATORY on an overlay that is not an identity cut (a variant's "
+                              f"quality must not be confounded with a requantisation)")
+            if needs_im_any and IMATRIX_KEY not in b.fields:
+                errors.append(f"{IMATRIX_KEY} absent — this overlay's type(s) "
+                              f"{', '.join(needs_im_any)} REQUIRE an importance matrix "
+                              f"(llama-quant.cpp:856), so the matrix that weighted these bytes "
+                              f"is a fact the file must carry")
+        if IMATRIX_KEY in b.fields and not needs_im_any:
+            errors.append(f"{IMATRIX_KEY} present but this overlay's type(s) "
+                          f"{', '.join(sorted(file_types))} cannot use an importance matrix "
+                          f"(llama-quant.cpp:856) — a FALSE PROVENANCE claim: nothing was "
+                          f"imatrix-weighted, so the stamp names a matrix no quantiser read")
+        if EXPERT_CROP_KEY in b.fields and IMATRIX_KEY not in b.fields:
+            errors.append(f"{EXPERT_CROP_KEY} present without {IMATRIX_KEY} — the crop is a "
+                          f"statement about the matrix that was cropped, and there is no such "
+                          f"statement here (false provenance, V4.4)")
     finally:
         os.close(fd_a)
         os.close(fd_b)
@@ -2306,7 +2603,9 @@ def verify(base: Path, overlay: Path, f16: Path | None = None, imatrix_path: Pat
           f"whole-tensor), {n_experts} expert slab(s), {human(n_bytes_cmp)} compared byte-for-byte")
     print(f"payload     : {n_tensors_ok}/{len(ov_tensors)} override tensors byte-identical "
           f"({n_ok_units}/{n_cmp_units} compared unit(s): expert slabs of an expert-slice, or "
-          f"one whole tensor)")
+          f"one whole tensor)"
+          + (f" — {n_diff_type} tensor(s) NOT COMPARED: different-type regime, no cross-type "
+             f"byte comparison exists (V4.3 clause 5)" if n_diff_type else ""))
     if seg_cache:
         print("segments    : " + ", ".join(
             f"blk.{l}.{lg}=" + " ".join(f"[{s.lo},{s.hi})" for s in segs)
@@ -2388,16 +2687,28 @@ def main() -> None:
                    help="the >=16-bit source the base was quantised from (REQUIRED with "
                         "--requantise, and by --verify for the reproduction gate)")
     p.add_argument("--imatrix", "--imatrix-path", dest="imatrix_path", type=Path, default=None,
-                   help="the base's own imatrix GGUF (REQUIRED with --requantise: §5.3 is "
-                        "'re-quantise with the SAME imatrix', so it is an input, never a default)")
+                   help="the base's own imatrix GGUF. REQUIRED only when the TARGET type requires "
+                        "one — llama-quantize's own line (llama-quant.cpp:856): "
+                        "IQ3_XXS/IQ2_XXS/IQ2_XS/IQ2_S/IQ1_M/IQ1_S, and Q2_K inside a Q2_K_S file. "
+                        "REFUSED for a type that cannot use it (a stamp naming a matrix nothing "
+                        "read is false provenance)")
     p.add_argument("--type-file", type=Path, default=None,
-                   help="the base's own --tensor-type-file (REQUIRED with --requantise)")
+                   help="the base's own --tensor-type-file. OPTIONAL: the positional --quant-type "
+                        "decides the type when it is absent, and when it is present the produced "
+                        "type is checked against --target-type")
+    p.add_argument("--target-type", type=str, default=None,
+                   help="the ggml type the override must be PRODUCED at (e.g. Q5_K). Default: the "
+                        "base segment's own type — the SAME-TYPE regime (aubier S1-S5). A "
+                        "different value is the DIFFERENT-TYPE regime (S7): the tensor's own "
+                        "type IS the declaration (layout.md V4.3 clause 5), and the type must be "
+                        "expressible for every overridden tensor or the build STOPS")
     p.add_argument("--quant-type", type=str, default=None,
-                   help="the positional ftype for the quantiser run (default IQ2_XXS, which is "
-                        "the base's own); the type-file overrides it per tensor. It must be a "
-                        "QUANTISED type or llama-quantize ignores every override — MEASURED in "
-                        "an earlier unit. On --verify it is read from the file's own declared "
-                        "quantize_flags instead")
+                   help="the positional ftype for the quantiser run. Default: the TARGET type "
+                        "(--target-type, or the base segment's own), which is what makes a "
+                        "type-only build need no second declaration. The type-file still "
+                        "overrides it per tensor. It must be a QUANTISED type or llama-quantize "
+                        "ignores every override — MEASURED in an earlier unit. On --verify it is "
+                        "read from the file's own declared quantize_flags instead")
     p.add_argument("--nthread", type=int, default=8,
                    help="threads for the quantiser run (default 8)")
     p.add_argument("--llama-quantize", type=Path, default=None,
@@ -2461,11 +2772,11 @@ def main() -> None:
     sys.exit(build(args.base, args.out, args.override, args.identity, args.delta, args.manifest,
                    args.imatrix_sha256, args.quant_flags, f16=args.f16,
                    requantise=args.requantise, imatrix_path=args.imatrix_path,
-                   type_file=args.type_file, quant_type=args.quant_type or "IQ2_XXS",
+                   type_file=args.type_file, quant_type=args.quant_type,
                    nthread=args.nthread, quantize_bin=args.llama_quantize,
                    workdir=args.workdir, delta_synth=args.delta_synth,
                    input_sha=args.input_sha256, lora=args.lora,
-                   lora_config=args.lora_config))
+                   lora_config=args.lora_config, target_type=args.target_type))
 
 
 if __name__ == "__main__":
