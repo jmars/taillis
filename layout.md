@@ -562,8 +562,28 @@ blk.<l>.<logical>.ov<K>.weight          ne = (…, …, n_ov)      one band of e
    comparator", §7.2 rule 4). No new key is invented for this: `tools/check_chain.py` G3 already
    verifies `sha256(--parent) == parent_sha256`, so **G3 applies to overlays unchanged** — this is the
    whole reason overlays reuse the namespace rather than starting a parallel one.
-5. **A type mismatch against the target group is a named failure at load**, not at first use. For a
-   WHOLE-TENSOR override the check is against the base tensor's own type, and the shape must match too.
+5. **THE PER-SET TYPE IS THE TENSOR'S OWN GGML TYPE FIELD. There is no separate type encoding, no
+   second declaration, and nothing to parse.** A GGUF tensor carries exactly one type; the override
+   tensor *is* the set, its `ne[2]` *is* the cardinality, its type *is* the variant's type, and
+   `taillis.overlay_experts.<ovk>` *is* the membership. A loader that expects an encoding for "the
+   type of a set" is looking for something this format deliberately does not have — the same reason
+   R2 removed the grouping array and V4.4 forbids `overlay_target`/`overlay_group`.
+   **Which type is legal, and the one check that follows from it:** any type whose block size divides
+   `ne[0]` (§1). Two regimes, and the loader must know which it is in, because they are different
+   changes:
+   - **SAME-TYPE** (aubier's S1–S5): the override's type EQUALS the base group's type, so the overlay
+     is a source-pointer swap and nothing else. A mismatch here is a named failure at load, not at
+     first use.
+   - **DIFFERENT-TYPE** (aubier's S7): the override's type deliberately DIFFERS from the base group's.
+     The store must then give those experts their own SEGMENT, because a slice carries one type. The
+     type is still just the tensor's ggml type — nothing about the encoding changes, only what the
+     engine must build. Note the practical consequence: **a different-type override over the shipped
+     `IQ2_XXS`/`IQ2_S` base needs no imatrix**, because `llama-quantize` requires one only for
+     `IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_M, IQ1_S` (and `Q2_K` inside a `Q2_K_S` file)
+     — MEASURED, `src/llama-quant.cpp:856`, `tensor_requires_imatrix`. That is what makes an S7
+     variant over the product base buildable at all today, and it is why S7 is worth doing first.
+   For a WHOLE-TENSOR override the check is against the base tensor's own type, and the shape must
+   match too.
    **An overlay carries NO model KV** — no `general.architecture`, no `<arch>.block_count`, no expert
    count. It is not a model; a loader takes all of that from the BASE and must not read it from the
    overlay (and an overlay that carries it is malformed, because it is a second copy of a fact the base
